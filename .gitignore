@@ -1,1 +1,3 @@
 .vscode
+femtotron/__pycache__
+femtotron/tensor_parallel/__pycache__

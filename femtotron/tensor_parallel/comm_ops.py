@@ -29,7 +29,7 @@ class CopyToTPRegion(torch.autograd.Function):
         # 在 tp_group 上 all-reduce grad_output
         # 返回 (all_reduced_grad, None)
         # None 对应 tp_group 参数的梯度（不需要）
-        grad_output, _ = grad_outputs
+        grad_output, *_ = grad_outputs
         dist.all_reduce(tensor=grad_output, op=ReduceOp.SUM, group=ctx.tp_group)
         return grad_output, None
 
@@ -44,7 +44,7 @@ class GatherFromTPRegion(torch.autograd.Function):
     大部分中间层不需要这个，Column 的切分输出直接喂给 Row。
     """
     @staticmethod
-    def forward(ctx, x_partial : Tensor, tp_group : ProcessGroup, gather_dim : int):
+    def forward(ctx, x_partial : Tensor, tp_group : ProcessGroup, gather_dim : int = -1):
         # 保存 gather_dim
         # 在 tp_group 上沿 gather_dim 做 all-gather
         # 返回拼接后的完整 tensor
@@ -78,7 +78,7 @@ class GatherFromTPRegion(torch.autograd.Function):
             (world_size * x.shape[0], *x.shape[1:]),
             dtype=x.dtype, device=x.device,
         )
-        dist.all_gather_into_tensor(output_tensor=x_all, input_tensor=x_partial, group=tp_group)
+        dist.all_gather_into_tensor(output_tensor=x_all, input_tensor=x, group=tp_group)
         return x_all.transpose(0, gather_dim).contiguous()
 
     @staticmethod
@@ -86,7 +86,7 @@ class GatherFromTPRegion(torch.autograd.Function):
         # 沿 gather_dim 切分 grad_output
         # 当前 rank 只取自己对应的那一片
         # 返回 (grad_partial, None, None)
-        grad_output, _ = grad_outputs
+        grad_output, *_ = grad_outputs
         grad_partial = torch.narrow(input=grad_output, 
                                     dim=ctx.gather_dim,
                                     start=ctx.tp_rank * ctx.chunk_size, 
@@ -120,7 +120,7 @@ class ReduceFromTPRegion(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs : Tensor):
         # identity，直接返回 (grad_output, None)
-        grad_output, _ = grad_outputs
+        grad_output, *_ = grad_outputs
         return grad_output, None
 
 class ScatterToTPRegion(torch.autograd.Function):
@@ -133,7 +133,7 @@ class ScatterToTPRegion(torch.autograd.Function):
     比如模型的第一层，输入 embedding 是完整的，需要先 scatter 再喂给 Row。
     """
     @staticmethod
-    def forward(ctx, x : Tensor, tp_group : ProcessGroup, split_dim : int):
+    def forward(ctx, x : Tensor, tp_group : ProcessGroup, split_dim : int = -1):
         # 沿 split_dim 切分 x，当前 rank 取第 tp_rank 片
         # 返回 x_partial
         world_size = dist.get_world_size(tp_group)
@@ -156,7 +156,7 @@ class ScatterToTPRegion(torch.autograd.Function):
         # 返回 (grad_full, None, None)
         world_size = ctx.world_size
         tp_group = ctx.tp_group
-        grad_output, _ = grad_outputs
+        grad_output, *_ = grad_outputs
         if ctx.world_size == 1:
             return grad_output, None, None
         split_dim = ctx.split_dim
