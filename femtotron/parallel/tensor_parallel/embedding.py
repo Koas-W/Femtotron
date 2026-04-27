@@ -4,8 +4,10 @@ import torch.distributed as dist
 from torch.distributed import ReduceOp, ProcessGroup
 from torch import nn
 import torch.nn.functional as F
+
 from .comm_ops import CopyToTPRegion, GatherFromTPRegion, ReduceFromTPRegion, ScatterToTPRegion
 from femtotron.parallel_context import ParallelContext
+from femtotron.model.parallel_plan import ParallelRule
 
 class VocabParallelEmbedding(nn.Module):
     """
@@ -38,18 +40,19 @@ class VocabParallelEmbedding(nn.Module):
                  dtype=None,
                  ):
         super().__init__()
-        # vocab_size 必须能被 tp_size 整除
+        # global_vocab_size 必须能被 tp_size 整除
         # 如果不能整除，需要 padding 到能整除的最近值
-        # self.weight: nn.Parameter, shape [vocab_size // tp_size, hidden_size]
-        # self.vocab_start_idx = tp_rank * (vocab_size // tp_size)
-        # self.vocab_end_idx = (tp_rank + 1) * (vocab_size // tp_size)
+        # 传入的 vocab_size 是已经处理之后的，相当于 global_vocab_size // tp_size
+        # self.weight: nn.Parameter, shape [global_vocab_size // tp_size, hidden_size]
+        # self.vocab_start_idx = tp_rank * (global_vocab_size // tp_size)
+        # self.vocab_end_idx = (tp_rank + 1) * (global_vocab_size // tp_size)
         self.group = parallel_ctx.get_group(parallel_dim_name)
         self.world_size = parallel_ctx.get_size(parallel_dim_name)
         self.rank = parallel_ctx.get_rank(parallel_dim_name)
 
-        self.weight = torch.nn.Parameter(torch.randn(vocab_size // self.world_size, hidden_size, device=device, dtype=dtype))
-        self.vocab_start_idx = self.rank * (vocab_size // self.world_size)
-        self.vocab_end_idx = (self.rank + 1) * (vocab_size // self.world_size)
+        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size, device=device, dtype=dtype))
+        self.vocab_start_idx = self.rank * (vocab_size)
+        self.vocab_end_idx = (self.rank + 1) * (vocab_size)
 
     def forward(self, input_ids : Tensor):
         # 1. 将 input_ids 中不在 [vocab_start, vocab_end) 范围内的 ID mask 掉
@@ -73,8 +76,30 @@ class VocabParallelEmbedding(nn.Module):
         ReduceFromTPRegion.apply(output, self.group)
         return output
 
+    
     @classmethod
-    def from_embedding(cls, embedding: nn.Embedding, parallel_ctx):
+    def from_embedding(cls, embedding: nn.Embedding, parallel_ctx: ParallelContext, rule: ParallelRule):
+        """
+        从完整的 nn.Embedding 构造 VocabParallelEmbedding。
+        沿 vocab 维度（dim=0）切分权重。
+        
+        embedding.weight shape: [vocab_size, hidden_size]
+        切分后每个 rank:        [vocab_size // tp_size, hidden_size]
+        """
+        world_size = parallel_ctx.get_size("tp")
+        tp_rank = parallel_ctx.get_rank("tp")
+        
+        vocab_size = embedding.num_embeddings
+        hidden_size = embedding.embedding_dim
+        
+        tp_embed = cls(vocab_size // world_size, hidden_size, parallel_ctx,
+                       device=embedding.weight.device, dtype=embedding.weight.dtype)
+        
+        return tp_embed
+
+
+    @classmethod
+    def from_embedding_temp(cls, embedding: nn.Embedding, parallel_ctx: ParallelContext):
         """
         从完整的 nn.Embedding 构造 VocabParallelEmbedding。
         沿 vocab 维度（dim=0）切分权重。
@@ -90,7 +115,7 @@ class VocabParallelEmbedding(nn.Module):
         vocab_size = embedding.num_embeddings
         hidden_size = embedding.embedding_dim
         
-        tp_embed = cls(vocab_size, hidden_size, parallel_ctx,
+        tp_embed = cls(vocab_size // tp_size, hidden_size, parallel_ctx,
                        device=embedding.weight.device, dtype=embedding.weight.dtype)
         
         # 权重 [vocab, hidden] 沿 vocab 切分

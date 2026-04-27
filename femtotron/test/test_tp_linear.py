@@ -28,8 +28,8 @@ from collections import OrderedDict
 
 # === 根据你的项目结构调整这个 import ===
 from femtotron.parallel_context import ParallelContext
-from femtotron.tensor_parallel.linear import ColumnParallelLinear, RowParallelLinear
-from femtotron.tensor_parallel.embedding import VocabParallelEmbedding
+from femtotron.parallel.tensor_parallel.linear import ColumnParallelLinear, RowParallelLinear
+from femtotron.parallel.tensor_parallel.embedding import VocabParallelEmbedding
 
 
 # ============================================================
@@ -127,7 +127,7 @@ def test_column_parallel_linear(parallel_ctx):
     
     # --- TP 版本: ColumnParallelLinear (gather_output=True) ---
     # 用 from_linear 从完整权重构造（测试用）
-    col_linear = ColumnParallelLinear.from_linear(
+    col_linear = ColumnParallelLinear.from_linear_temp(
         nn.Linear(in_features, out_features, bias=False).cuda(),
         parallel_ctx,
         gather_output=True,
@@ -157,7 +157,7 @@ def test_column_parallel_linear(parallel_ctx):
     
     # --- 测试 gather_output=False 的情况 ---
     log("\n  --- gather_output=False ---")
-    col_linear_no_gather = ColumnParallelLinear.from_linear(
+    col_linear_no_gather = ColumnParallelLinear.from_linear_temp(
         nn.Linear(in_features, out_features, bias=False).cuda(),
         parallel_ctx,
         gather_output=False,
@@ -212,7 +212,7 @@ def test_row_parallel_linear(parallel_ctx):
     
     # --- TP 版本: RowParallelLinear (scatter_input=False) ---
     # RowParallel 期望输入已经是切分的
-    row_linear = RowParallelLinear.from_linear(
+    row_linear = RowParallelLinear.from_linear_temp(
         nn.Linear(in_features, out_features, bias=False).cuda(),
         parallel_ctx,
         scatter_input=False,
@@ -295,14 +295,14 @@ def test_column_row_chain(parallel_ctx):
     # --- TP 版本: Column(gather=False) → ReLU → Row(scatter=False) ---
     chunk_ffn = ffn_dim // tp_size
     
-    tp_up = ColumnParallelLinear.from_linear(
+    tp_up = ColumnParallelLinear.from_linear_temp(
         nn.Linear(hidden, ffn_dim, bias=False).cuda(),
         parallel_ctx,
         gather_output=False,
     )
     tp_up.weight.data.copy_(ref_up_weight[tp_rank * chunk_ffn : (tp_rank + 1) * chunk_ffn, :])
     
-    tp_down = RowParallelLinear.from_linear(
+    tp_down = RowParallelLinear.from_linear_temp(
         nn.Linear(ffn_dim, hidden, bias=False).cuda(),
         parallel_ctx,
         scatter_input=False,
@@ -374,7 +374,7 @@ def test_vocab_parallel_embedding(parallel_ctx):
     ref_w_grad = ref_embed.weight.grad.clone()
     
     # --- TP 版本 ---
-    tp_embed = VocabParallelEmbedding.from_embedding(ref_embed, parallel_ctx)
+    tp_embed = VocabParallelEmbedding.from_embedding_temp(ref_embed, parallel_ctx)
     
     tp_out = tp_embed(input_ids)
     tp_out.sum().backward()
@@ -420,7 +420,7 @@ def test_tp_one_degeneracy(parallel_ctx):
     set_seed(42)
     
     ref_linear = nn.Linear(in_features, out_features, bias=False).cuda()
-    col_linear = ColumnParallelLinear.from_linear(ref_linear, parallel_ctx, gather_output=False)
+    col_linear = ColumnParallelLinear.from_linear_temp(ref_linear, parallel_ctx, gather_output=False)
     
     x = torch.randn(batch_size, seq_len, in_features, device="cuda", requires_grad=True)
     ref_x = x.clone().detach().requires_grad_(True)

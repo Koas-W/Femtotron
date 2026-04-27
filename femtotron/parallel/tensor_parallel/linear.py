@@ -4,8 +4,10 @@ import torch.distributed as dist
 from torch.distributed import ReduceOp, ProcessGroup
 from torch import nn
 import torch.nn.functional as F
+
 from .comm_ops import CopyToTPRegion, GatherFromTPRegion, ReduceFromTPRegion, ScatterToTPRegion
 from femtotron.parallel_context import ParallelContext
+from femtotron.model.parallel_plan import ParallelPlan, ParallelRule
 
 class ColumnParallelLinear(nn.Module):
     """
@@ -72,9 +74,32 @@ class ColumnParallelLinear(nn.Module):
             y = y_partial
         return y
 
+
     # ColumnParallelLinear
     @classmethod
-    def from_linear(cls, linear: nn.Linear, parallel_ctx, gather_output=False):
+    def from_linear(cls, linear: nn.Linear, parallel_ctx: ParallelContext, rule: ParallelRule) -> "ColumnParallelLinear":
+        """
+        从完整的 nn.Linear 构造 ColumnParallelLinear。
+        沿输出维度（dim=0）切分权重。
+        
+        linear.weight shape: [out_features, in_features]
+        切分后每个 rank:     [out_features // tp_size, in_features]
+        """
+        world_size = parallel_ctx.tp_size
+        assert linear.out_features % world_size == 0
+        return cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features // world_size,
+            bias=linear.bias is not None,
+            parallel_ctx=parallel_ctx,
+            gather_output=rule.kwargs["gather_output"],
+            device=linear.weight.device,   # 自动推断
+            dtype=linear.weight.dtype,     # 自动推断
+        )
+    
+    # ColumnParallelLinear
+    @classmethod
+    def from_linear_temp(cls, linear: nn.Linear, parallel_ctx, gather_output=False):
         """
         从完整的 nn.Linear 构造 ColumnParallelLinear。
         沿输出维度（dim=0）切分权重。
@@ -182,9 +207,32 @@ class RowParallelLinear(nn.Module):
             y = y + self.bias
         return y
 
+    
     # RowParallelLinear
     @classmethod
-    def from_linear(cls, linear: nn.Linear, parallel_ctx, scatter_input=False):
+    def from_linear(cls, linear: nn.Linear, parallel_ctx: ParallelContext, rule: ParallelRule) -> "RowParallelLinear":
+        """
+        从完整的 nn.Linear 构造 RowParallelLinear
+        沿输入维度（dim=1）切分权重。
+        
+        linear.weight shape: [out_features, in_features]
+        切分后每个 rank:     [out_features, in_features // tp_size]
+        """
+        world_size = parallel_ctx.tp_size
+        assert linear.out_features % world_size == 0
+        return cls(
+            in_features=linear.in_features // world_size,
+            out_features=linear.out_features,
+            bias=linear.bias is not None,
+            parallel_ctx=parallel_ctx,
+            scatter_input=rule.kwargs["scatter_input"],
+            device=linear.weight.device,   # 自动推断
+            dtype=linear.weight.dtype,     # 自动推断
+        )
+
+    # RowParallelLinear
+    @classmethod
+    def from_linear_temp(cls, linear: nn.Linear, parallel_ctx, scatter_input=False):
         """
         从完整的 nn.Linear 构造 RowParallelLinear。
         沿输入维度（dim=1）切分权重。
