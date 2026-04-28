@@ -90,6 +90,16 @@ ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
 endif
 	@echo -e "$(GREEN)  Model Loading ✓$(NC)"
 
+# 1.4 混合精度训练
+test-model-loading:
+	@echo -e "$(YELLOW)>>> 测试 Mixed Precision (1卡, TP=1 退化)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_1) femtotron/test/unit/test_mixed_precision.py
+ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
+	@echo -e "$(YELLOW)>>> 测试 Model Loading (2卡, TP=2)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/unit/test_mixed_precision.py
+endif
+	@echo -e "$(GREEN)  Mixed Precision ✓$(NC)"
+
 # ============================================================
 # 集成测试（后续开发时逐步添加）
 # ============================================================

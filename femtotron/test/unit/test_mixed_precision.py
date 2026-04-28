@@ -44,8 +44,8 @@ from femtotron.training.grad_transform import GradTransform, ClipGradNorm
 # ============================================================
 
 def init_distributed():
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     torch.cuda.set_device(local_rank)
     return local_rank
 
