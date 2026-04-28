@@ -91,9 +91,9 @@ class ModelLoader:
                     parent = model.get_submodule(parent_name)
 
                     if attr in parent._parameters:
-                        parent._parameters[attr] = nn.Parameter(
-                            tensor, requires_grad=parent._parameters[attr].requires_grad
-                        )
+                        old = parent._parameters[attr]
+                        requires_grad = old.requires_grad if old is not None else True
+                        parent._parameters[attr] = nn.Parameter(tensor, requires_grad=requires_grad)
                     elif attr in parent._buffers:
                         parent._buffers[attr] = tensor
 
