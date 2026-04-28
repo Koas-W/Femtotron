@@ -37,7 +37,7 @@ def _build_row_linear(old, parallel_ctx, rule):
     return RowParallelLinear.from_linear(old, parallel_ctx, rule)
 
 
-@register_builder("vocab", nn.Embedding)
+@register_builder("vocab_embed", nn.Embedding)
 def _build_vocab_embedding(old, parallel_ctx, rule):
     assert isinstance(old, nn.Embedding)
     return VocabParallelEmbedding.from_embedding(old, parallel_ctx, rule)

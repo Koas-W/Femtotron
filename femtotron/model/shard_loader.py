@@ -24,7 +24,7 @@ class DimShardLoader:
         chunk = size // world_size
         slices: list[slice] = [slice(None)] * len(shape)
         slices[self.dim] = slice(rank * chunk, (rank + 1) * chunk)
-        return handle[slices]
+        return handle[tuple(slices)]
     
 
 ##################### 注册工厂 #######################
@@ -54,7 +54,7 @@ def _row_loader(rule: ParallelRule, suffix: str) -> ShardLoader:
     return DimShardLoader(dim=1)
 
 
-@register_loader("vocab")
+@register_loader("vocab_embed")
 def _vocab_loader(rule: ParallelRule, suffix: str) -> ShardLoader:
     return DimShardLoader(dim=0)
 

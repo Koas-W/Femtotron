@@ -82,18 +82,70 @@ class ModelLoader:
                     if name not in state:
                         continue  # 模型不要这个参数（比如 lm_head tie weights）
 
-                    rule = parallel_plan.get_rule(name)
+                    module_name = name.rsplit(".", 1)[0]  # "model.layers.0.self_attn.q_proj.weight" → "model.layers.0.self_attn.q_proj"
+                    rule = parallel_plan.get_rule(module_name)
                     tensor = load_one_param(f, name, rule, tp_rank, tp_world_size)
 
                     # 写入 model 参数（确保 dtype/device 一致）
-                    target = state[name]
-                    with torch.no_grad():
-                        target.copy_(tensor)
+                    parent_name, attr = name.rsplit(".", 1)
+                    parent = model.get_submodule(parent_name)
+
+                    if attr in parent._parameters:
+                        parent._parameters[attr] = nn.Parameter(
+                            tensor, requires_grad=parent._parameters[attr].requires_grad
+                        )
+                    elif attr in parent._buffers:
+                        parent._buffers[attr] = tensor
+
+        _materialize_computed_buffers(model, device)
 
         # 5. 等所有 rank 加载完
         if dist.is_initialized():
             dist.barrier()
+
+def _materialize_computed_buffers(model, device):
+    """
+    加载 checkpoint 后，重新计算仍在 meta device 上的 buffer。
     
+    这些 buffer 是 persistent=False 的（如 rotary embedding 的 inv_freq），
+    不会被保存到 checkpoint 中，需要从模块自身的构造逻辑重新计算。
+    
+    策略：对每个含有 meta buffer 的模块，用同样的 config 在真实 device 上
+    重新实例化该模块类，提取计算好的 buffer 值，替换 meta 占位符。
+    """
+    for module in model.modules():
+        # 找出这个 module 中所有仍在 meta 上的 buffer
+        meta_buffers = [
+            name for name, buf in module._buffers.items()
+            if buf is not None and buf.device.type == "meta"
+        ]
+        if not meta_buffers:
+            continue
+
+        # 尝试用模块自身的 config 重新实例化来获取 buffer 值
+        cls = type(module)
+        
+        if hasattr(module, "config"):
+            try:
+                with torch.device(device):
+                    fresh = cls(module.config)
+                for buf_name in meta_buffers:
+                    fresh_buf = fresh._buffers.get(buf_name)
+                    if fresh_buf is not None:
+                        module._buffers[buf_name] = fresh_buf
+                del fresh
+                continue  # 成功，处理下一个 module
+            except Exception:
+                print("auto reinitialize failed")
+                pass  # 构造函数签名不匹配，走 fallback
+
+        # Fallback：分配空 tensor（形状和 dtype 正确，值可能不对，
+        # 但对于某些 buffer 如 causal_mask，forward 中会重新计算）
+        for buf_name in meta_buffers:
+            buf = module._buffers[buf_name]
+            module._buffers[buf_name] = torch.empty(
+                buf.shape, dtype=buf.dtype, device=device
+            )
     # def _get_param_parallel_info(self, module: nn.Module) -> tuple[bool, int | None]:
     #     """
     #     判断一个 module 的权重是否需要切分，以及沿哪个维度。

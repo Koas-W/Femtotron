@@ -53,7 +53,7 @@ class ColumnParallelLinear(nn.Module):
         self.group = parallel_ctx.get_group(parallel_dim_name)
         self.world_size = parallel_ctx.get_size(parallel_dim_name)
         self.rank = parallel_ctx.get_rank(parallel_dim_name)
-        self.weight = torch.nn.Parameter(torch.randn(out_features // self.world_size, in_features, device=device, dtype=dtype))
+        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features, device=device, dtype=dtype))
         if bias:
             self.bias = torch.nn.Parameter(torch.randn(out_features, device=device, dtype=dtype))
         else:
@@ -113,7 +113,7 @@ class ColumnParallelLinear(nn.Module):
         tp_rank = parallel_ctx.get_rank("tp")
         
         in_features = linear.in_features
-        out_features = linear.out_features
+        out_features = linear.out_features // tp_size
         has_bias = linear.bias is not None
         
         col_linear = cls(
@@ -124,7 +124,7 @@ class ColumnParallelLinear(nn.Module):
         )
         
         # 权重 [out, in] 沿 out 切分
-        chunk = out_features // tp_size
+        chunk = out_features
         col_linear.weight.data.copy_(
             linear.weight.data[tp_rank * chunk : (tp_rank + 1) * chunk, :]
         )
@@ -180,7 +180,7 @@ class RowParallelLinear(nn.Module):
         self.group = parallel_ctx.get_group(parallel_dim_name)
         self.world_size = parallel_ctx.get_size(parallel_dim_name)
         self.rank = parallel_ctx.get_rank(parallel_dim_name)
-        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features // self.world_size, device=device, dtype=dtype))
+        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features, device=device, dtype=dtype))
         if bias:
             self.bias = torch.nn.Parameter(torch.randn(out_features, device=device, dtype=dtype))
         else:
@@ -245,7 +245,7 @@ class RowParallelLinear(nn.Module):
         tp_size = parallel_ctx.get_size("tp")
         tp_rank = parallel_ctx.get_rank("tp")
         
-        in_features = linear.in_features
+        in_features = linear.in_features // tp_size
         out_features = linear.out_features
         has_bias = linear.bias is not None
         
@@ -257,7 +257,7 @@ class RowParallelLinear(nn.Module):
         )
         
         # 权重 [out, in] 沿 in 切分
-        chunk = in_features // tp_size
+        chunk = in_features
         row_linear.weight.data.copy_(
             linear.weight.data[:, tp_rank * chunk : (tp_rank + 1) * chunk]
         )

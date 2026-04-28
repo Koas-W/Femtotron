@@ -26,7 +26,7 @@ def parallelize_model(model: nn.Module,
          参数 shape 已经是切分后的（out_features//tp 或 in_features//tp）
        - 替换原来的子 module
     3. 对 nn.Embedding 做类似处理
-    4. 返回修改后的 model
+    4. 返回并行化后的 model
     
     替换 sub-module 的方式：
       parent_module 是持有 child 的那个 module，
@@ -49,6 +49,8 @@ def parallelize_model(model: nn.Module,
             parent[int(attr)] = new
         else:
             setattr(parent, attr, new)
+    
+    return model
 
 def _resolve_parent(root: nn.Module, qualified_name: str) -> tuple[nn.Module, str]:
     parts = qualified_name.split(".")
