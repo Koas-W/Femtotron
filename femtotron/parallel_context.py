@@ -25,9 +25,9 @@ class ParallelContext:
         self.parallel_dims = self._normalize_parallel_dims(parallel_dims)
         self.world_size = dist.get_world_size()
         self.world_rank = dist.get_rank()
-        self.parallel_dims = parallel_dims
-        self.dim_names = list(parallel_dims.keys())
-        self.dim_sizes = list(parallel_dims.values())
+        # self.parallel_dims = parallel_dims
+        self.dim_names = list(self.parallel_dims.keys())
+        self.dim_sizes = list(self.parallel_dims.values())
 
         # 检查输入参数一致性
         total_size = 1
