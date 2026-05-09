@@ -206,3 +206,99 @@ class MixedPrecisionManager:
         # 6. 清理
         self.zero_grad()
         return True
+    
+    def state_dict(self) -> dict:
+        """序列化训练状态。
+        
+        包含：
+        - 所有参数的 FP32 master weights（按 name 索引）
+        - inner optimizer 的 state（Adam 的 m/v 等）
+        - grad accumulator 的 buffer 状态
+        - 配置元信息（用于 load 时一致性检查）
+        
+        不包含：
+        - compute params（在 model.state_dict() 里，trainer 单独保存）
+        - grad_transforms（无状态）
+        """
+        return {
+            "version": 1,   # checkpoint 格式版本，后续兼容用
+            
+            # FP32 master weights，按参数 name 索引（不依赖顺序）
+            "master_weights": {
+                g.name: g.master.detach().cpu()
+                for g in self.groups
+                if g.master is not None
+            },
+            
+            # 内部 optimizer 状态（Adam m/v、step 计数等）
+            "inner_optimizer": self.inner.state_dict(),
+            
+            # 每个 ParamGroup 对应的 grad accumulator buffer
+            "grad_accumulators": {
+                g.name: ga.state_dict()
+                for g, ga in zip(self.groups, self.grad_accs)
+            },
+            
+            # 配置一致性检查
+            "config": {
+                "master_dtype": str(self.config.master_dtype) if self.config.master_dtype else None,
+                "param_dtype": str(self.config.param_dtype),
+                "num_groups": len(self.groups),
+                "param_names": [g.name for g in self.groups],
+            },
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        """从 state_dict 恢复训练状态。
+        
+        必须在 trainer 加载完 model.state_dict 之后调用——
+        否则 master 会从未初始化的 compute 重建，覆盖 ckpt 内容。
+        """
+        # 1. 版本和配置一致性
+        assert sd.get("version") == 1, f"unsupported checkpoint version: {sd.get('version')}"
+        
+        ckpt_cfg = sd["config"]
+        assert ckpt_cfg["num_groups"] == len(self.groups), (
+            f"param group count mismatch: ckpt has {ckpt_cfg['num_groups']}, "
+            f"current has {len(self.groups)}"
+        )
+        expected_dtype = str(self.config.master_dtype) if self.config.master_dtype else None
+        assert ckpt_cfg["master_dtype"] == expected_dtype, (
+            f"master_dtype mismatch: ckpt={ckpt_cfg['master_dtype']}, current={expected_dtype}"
+        )
+        
+        current_names = [g.name for g in self.groups]
+        if ckpt_cfg["param_names"] != current_names:
+            # 给个有用的诊断信息
+            only_in_ckpt = set(ckpt_cfg["param_names"]) - set(current_names)
+            only_in_current = set(current_names) - set(ckpt_cfg["param_names"])
+            raise RuntimeError(
+                f"param names mismatch.\n"
+                f"  Only in ckpt: {sorted(only_in_ckpt)[:5]}{'...' if len(only_in_ckpt) > 5 else ''}\n"
+                f"  Only in current: {sorted(only_in_current)[:5]}{'...' if len(only_in_current) > 5 else ''}"
+            )
+        
+        # 2. 恢复 FP32 master weights
+        master_weights = sd["master_weights"]
+        for g in self.groups:
+            if g.master is None:
+                continue
+            if g.name not in master_weights:
+                raise RuntimeError(f"missing master weight for {g.name} in checkpoint")
+            ckpt_w = master_weights[g.name]
+            if ckpt_w.shape != g.master.shape:
+                raise RuntimeError(
+                    f"shape mismatch for {g.name}: "
+                    f"ckpt={tuple(ckpt_w.shape)}, current={tuple(g.master.shape)}"
+                )
+            with torch.no_grad():
+                g.master.copy_(ckpt_w.to(g.master.device))
+        
+        # 3. 恢复 inner optimizer 状态
+        self.inner.load_state_dict(sd["inner_optimizer"])
+        
+        # 4. 恢复 grad accumulator buffer
+        grad_acc_states = sd["grad_accumulators"]
+        for g, ga in zip(self.groups, self.grad_accs):
+            if g.name in grad_acc_states:
+                ga.load_state_dict(grad_acc_states[g.name])

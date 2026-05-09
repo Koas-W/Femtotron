@@ -68,3 +68,17 @@ class GradAccumulator:
             self.acc_buffer.zero_()
         if self.group.compute.grad is not None:
             self.group.compute.grad.zero_()
+
+    def state_dict(self) -> dict:
+        return {
+            "acc_buffer": self.acc_buffer.detach().cpu() if self.acc_buffer is not None else None,
+        }
+    
+    def load_state_dict(self, sd: dict) -> None:
+        if sd["acc_buffer"] is not None:
+            if self.acc_buffer is None:
+                self.acc_buffer = sd["acc_buffer"].to(...)
+            else:
+                self.acc_buffer.copy_(sd["acc_buffer"].to(self.acc_buffer.device))
+        else:
+            self.acc_buffer = None
