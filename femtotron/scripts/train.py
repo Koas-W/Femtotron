@@ -44,6 +44,7 @@ from femtotron.parallel.data_parallel.ddp import DataParallelGradSync
 from femtotron.parallel.data_parallel.gradient_synchronizer import GradientSynchronizer
 from femtotron.data.data_loader import DistributedDataLoader
 from femtotron.data.preprocess import preprocess
+from femtotron.data.collator import Collator, simple_pretrain_collator, PadSftCollator
 
 def init_distributed():
     dist.init_process_group(backend="nccl")
@@ -290,6 +291,9 @@ def build_all(config: dict):
         dataset=train_data,
         parallel_ctx=parallel_ctx,
         micro_batch_size=micro_batch_size,
+        collator=simple_pretrain_collator,  # 定长输入，直接 stack
+        sampler=None,  # 使用默认的DistributedSampler
+        num_workers=config.get("num_workers", 2),
     )
 
     tokens_per_step = micro_batch_size * seq_len * dp_size

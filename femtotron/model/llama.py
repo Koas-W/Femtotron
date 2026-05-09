@@ -96,7 +96,7 @@ class LlamaForTraining(nn.Module):
         # logits: [B, S-1, V] 完整 vocab
         # labels: [B, S-1]，-100 位置忽略
         return F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
+            logits.float().view(-1, logits.size(-1)),
             labels.view(-1),
             ignore_index=-100,
         )

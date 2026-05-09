@@ -199,7 +199,7 @@ class Trainer:
             steps_done = self.global_step - self._last_log_step
             tokens_per_step_per_gpu = (
                 self.dataloader.micro_batch_size
-                * self.dataloader.dataset.seq_len   # dataset 暴露 seq_len
+                * self.dataloader.dataset.shape[1]   # dataset 暴露 seq_len
                 * self.train_config.grad_accum_steps
             )
             tps_per_gpu = tokens_per_step_per_gpu * steps_done / elapsed
@@ -214,7 +214,7 @@ class Trainer:
         msg = (
             f"step {self.global_step:>6}/{self.train_config.train_steps} | "
             f"loss {info['loss']:7.4f} | "
-            f"grad_norm {info['grad_norm']:6.3f} | "
+            # f"grad_norm {info['grad_norm']:6.3f} | "
             f"lr {info['lr']:.2e} | "
             f"tps/gpu {tps_per_gpu:>7.0f} | "
             f"mem {peak_mem_gb:.1f}GB"

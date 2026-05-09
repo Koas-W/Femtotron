@@ -45,11 +45,18 @@ def preprocess(
     
     # 3. Concat + pack
     print("Concatenating...")
-    all_tokens: list[int] = []
-    for ids in tokenized["input_ids"]:
-        all_tokens.extend(ids)
-        all_tokens.append(eos_id)
+    # 一次性取出所有 input_ids，得到 list[list[int]]
+    all_ids = tokenized["input_ids"]
     
+    # 用 itertools.chain 避免反复 extend
+    import itertools
+    
+    def ids_with_eos():
+        for ids in all_ids:
+            yield from ids
+            yield eos_id
+    
+    all_tokens = list(ids_with_eos())
     print(f"Total tokens: {len(all_tokens):,}")
     
     # 4. Truncate to multiple of seq_len + reshape
