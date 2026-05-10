@@ -1,22 +1,3 @@
-import torch
-from torch import nn, Tensor
-from torch import distributed as dist
-from torch.distributed import ProcessGroup
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-from pathlib import Path
-from collections import defaultdict
-from safetensors import safe_open
-from typing import cast, Protocol
-from dataclasses import dataclass
-
-from femtotron.parallel_context import ParallelContext
-from femtotron.training.param_group import ParamGroup
-from femtotron.sharding.sharding_spec import ShardingSpec
-from femtotron.sharding.sharding_strategy import ShardingStrategy
-from femtotron.sharding.no_shard import NoShardStrategy
-from femtotron.sharding.zero1 import ZeRO1Strategy
-
 import os
 import sys
 import torch
@@ -43,9 +24,12 @@ from transformers import AutoConfig
 
 
 def init_distributed():
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
     return local_rank
 
 

@@ -15,10 +15,7 @@ from femtotron.parallel_context import ParallelContext
 from femtotron.sharding.sharding_strategy import ShardingStrategy
 from femtotron.sharding.no_shard import NoShardStrategy
 from femtotron.sharding.zero1 import ZeRO1Strategy
-
-@dataclass
-class ZeROConfig:
-    stage: int = 0   # 0 = no shard, 1 = ZeRO-1, 2 = ZeRO-2, 3 = ZeRO-3
+from femtotron.sharding.zero_config import ZeROConfig
 
 def create_sharding_strategy(
     parallel_ctx: ParallelContext,
