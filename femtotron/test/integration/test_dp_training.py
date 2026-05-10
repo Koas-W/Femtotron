@@ -167,24 +167,28 @@ def test_dp_consistency(world_size, device):
     log("=" * 60)
 
     model_config = get_tiny_config()
+    min_kv_heads = model_config.num_key_value_heads  # 4
     plan = get_llama_parallel_plan()
     num_steps = 20
     micro_batch_size = 4
     seq_len = 32
 
+    # 枚举所有 dp * tp == world_size 且 kv_heads % tp == 0 的组合
     configs_to_test = []
+    for tp in range(1, world_size + 1):
+        if world_size % tp != 0:
+            continue
+        if min_kv_heads % tp != 0:
+            continue
+        dp = world_size // tp
+        configs_to_test.append((f"DP={dp}, TP={tp}", dp, tp))
 
-    if world_size >= 2:
-        configs_to_test.append(("DP=1, TP={}".format(world_size), 1, world_size))
-        configs_to_test.append(("DP={}, TP=1".format(world_size), world_size, 1))
+    log(f"合法配置: {[c[0] for c in configs_to_test]}")
 
-    if world_size >= 4:
-        half = world_size // 2
-        configs_to_test.append(("DP={}, TP={}".format(half, half), half, half))
-
-    if world_size == 1:
-        # 单卡只能测一种配置
-        configs_to_test.append(("DP=1, TP=1", 1, 1))
+    if len(configs_to_test) < 2:
+        log("⚠ 合法配置不足 2 种，无法做对比测试")
+        log("  考虑增大 num_key_value_heads 或使用不同的 GPU 数量")
+        return True
 
     all_losses = {}
 
