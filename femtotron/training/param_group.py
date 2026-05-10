@@ -1,16 +1,20 @@
 import torch
-from torch import nn, Tensor
+from torch import nn, Tensor, dtype
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
 from dataclasses import field
 
 from femtotron.training.train_config import TrainConfig
 from femtotron.model.parallel_plan import ParallelPlan
 from femtotron.parallel_context import ParallelContext
+from femtotron.sharding.sharding_spec import ShardingSpec
 
 class ParamGroup:
     """一个参数的多份物理存储。"""
     name: str                       # 调试用
     compute: nn.Parameter           # forward/backward 用，dtype = param_dtype
     master: Tensor | None           # optimizer 用，dtype = master_dtype；None 表示无 master
+    master_spec: ShardingSpec | None  # master 的分片信息
     opt_config: dict = field(default_factory=dict)  # {"weight_decay": 0.01} 等
     
     # 这些字段靠ParallelPlan和ParallelContext
@@ -23,10 +27,13 @@ class ParamGroup:
                  master: Tensor | None, 
                  opt_config: dict,
                  parallel_ctx: ParallelContext,
-                 parallel_plan: ParallelPlan) -> None:
+                 parallel_plan: ParallelPlan,
+                 master_spec: ShardingSpec | None = None
+                 ) -> None:
         self.name = name
         self.compute = compute
         self.master = master
+        self.master_spec = master_spec
         self.opt_config = opt_config
         
         # 从 plan 查这个参数的并行规则
@@ -84,3 +91,48 @@ class ParamGroup:
     def optimized_param(self) -> Tensor:
         """inner optimizer 实际看到、更新的 tensor。"""
         return self.master if self.master is not None else self.compute
+    
+    @property
+    def is_master_sharded(self) -> bool:
+        return self.master_spec is not None and self.master_spec.world_size > 1
+    
+    def assign_grad(self, grad: Tensor | None) -> None:
+        """grad 必须和 optimized_param 形状一致——
+        ZeRO-1 下这意味着 grad 已经是分片的（reduce_scatter 后）。"""
+        if grad is None:
+            self.optimized_param.grad = None
+            return
+        target = self.optimized_param
+        assert grad.shape == target.shape, f"shape mismatch: {grad.shape} vs {target.shape}"
+        target.grad = grad
+    
+    def gather_master_to_compute(self, dp_group: ProcessGroup) -> None:
+        """把分片的 master 收集起来，写回完整的 compute。
+        
+        ZeRO-1 step 之后调用——让所有 rank 的 compute 重新一致。
+        """
+        master = self.master
+        if master is None:
+            return    # 没有 master，无需同步
+        if not self.is_master_sharded:
+            # no-shard 路径：直接 cast
+            with torch.no_grad():
+                self.compute.copy_(master)
+            return
+        
+        # 分片路径：all-gather
+        spec = self.master_spec
+        assert spec is not None, "is_master_sharded=True implies master_spec is not None"
+
+        gathered = torch.empty(
+            spec.flat_size,
+            dtype=master.dtype,
+            device=master.device,
+        )
+        dist.all_gather_into_tensor(gathered, master, group=dp_group)
+        
+        # 截掉 padding，reshape 回完整形状
+        unpadded = gathered[: spec.flat_size - spec.pad_size]
+        full = unpadded.view(spec.full_shape).to(self.compute.dtype)
+        with torch.no_grad():
+            self.compute.copy_(full)

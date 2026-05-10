@@ -199,7 +199,7 @@ class Trainer:
             steps_done = self.global_step - self._last_log_step
             tokens_per_step_per_gpu = (
                 self.dataloader.micro_batch_size
-                * self.dataloader.dataset.shape[1]   # dataset 暴露 seq_len
+                * self.dataloader.dataset.shape[1]   # dataset 暴露 seq_len # type:ignore
                 * self.train_config.grad_accum_steps
             )
             tps_per_gpu = tokens_per_step_per_gpu * steps_done / elapsed
@@ -295,6 +295,9 @@ class Trainer:
             dist.barrier()
         
         if dist.get_rank() == 0:
+            # 标记成功
+            with open(os.path.join(ckpt_dir, "_SUCCESS"), "w") as f:
+                f.write("ok")
             print(f"Saved checkpoint to {ckpt_dir}")
     
     def _load_checkpoint(self, ckpt_dir: str):
@@ -309,6 +312,11 @@ class Trainer:
         ctx = self.parallel_ctx
         
         # 一致性检查
+        success_file = os.path.join(ckpt_dir, "_SUCCESS")
+        if not os.path.isfile(success_file):
+            raise RuntimeError(
+                f"checkpoint at {ckpt_dir} is incomplete (missing _SUCCESS marker)"
+            )
         with open(os.path.join(ckpt_dir, "meta.json")) as f:
             meta = json.load(f)
         assert meta["tp_size"] == ctx.tp_size, (

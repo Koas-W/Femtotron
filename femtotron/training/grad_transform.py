@@ -34,9 +34,14 @@ class ClipGradNorm:
     
     5. 返回 global_norm（用于 logging）
     """
-    def __init__(self, max_norm: float, parallel_ctx: ParallelContext):
+    def __init__(self, max_norm: float, 
+                 parallel_ctx: ParallelContext,
+                 *,
+                 dp_sharded: bool = False,    # ZeRO 启用时为 True
+        ):
         self.max_norm = max_norm
         self.parallel_ctx = parallel_ctx
+        self.dp_sharded = dp_sharded
     
     def __call__(self, param_groups: list[ParamGroup], grads: list[Tensor]) -> Tensor:
         # 计算每个 grad 的局部 norm²
@@ -50,11 +55,19 @@ class ClipGradNorm:
             else:
                 replicated_sq_sum += local_sq
         
+        ctx = self.parallel_ctx
         # 只对 sharded 部分跨 TP all-reduce
-        if self.parallel_ctx.tp_group is not None and dist.get_world_size(self.parallel_ctx.tp_group) > 1:
-            dist.all_reduce(sharded_sq_sum, group=self.parallel_ctx.tp_group)
+        if ctx.tp_group is not None and dist.get_world_size(ctx.tp_group) > 1:
+            dist.all_reduce(sharded_sq_sum, group=ctx.tp_group)
         
-        total_sq = sharded_sq_sum + replicated_sq_sum
+        # total_sq = sharded_sq_sum + replicated_sq_sum
+        # ZeRO 启用时，所有 grad 在 DP 维度上分散，需要再跨 DP reduce
+        if self.dp_sharded and ctx.dp_group is not None and ctx.dp_size > 1:
+            total_sq = sharded_sq_sum + replicated_sq_sum
+            dist.all_reduce(total_sq, group=ctx.dp_group)
+        else:
+            total_sq = sharded_sq_sum + replicated_sq_sum
+
         total_norm = total_sq.sqrt()
         coef = (self.max_norm / (total_norm + 1e-6)).clamp(max=1.0)        
         for g in grads:

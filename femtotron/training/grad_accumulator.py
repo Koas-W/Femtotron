@@ -38,29 +38,18 @@ class GradAccumulator:
         g.zero_()
     
     def finalize(self) -> Tensor | None:
-        """完成所有累加，返回最终给 optimizer 的梯度。"""
+        """
+        返回累加好的本地 grad（不做通信、不做 dtype 转换）。
+        
+        通信和到 master_dtype 的 cast 由 ShardingStrategy 处理。
+        
+        Returns:
+            本 rank 持有的完整（compute_param 形状的）grad，dtype 是 grad 原生的（通常 bf16）。
+            若没有 grad（参数没参与本次 forward）返回 None。
+        """
         if self.acc_buffer is not None:
-            grad = self.acc_buffer
-        else:
-            grad = self.group.compute.grad
-        
-        if grad is None:
-            return None
-        
-        # DP all-reduce
-        if self.group.is_replicated_across_dp and self.parallel_ctx.dp_group is not None:
-            # 通信精度
-            comm_dtype = self.train_config.reduce_dtype or grad.dtype
-            if grad.dtype != comm_dtype:
-                grad = grad.to(comm_dtype)
-            dist.all_reduce(grad, group=self.parallel_ctx.dp_group)
-            grad.div_(dist.get_world_size(self.parallel_ctx.dp_group))   # 取平均
-        
-        # cast 到 master 期望的 dtype
-        if self.group.master is not None and grad.dtype != self.group.master.dtype:
-            grad = grad.to(self.group.master.dtype)
-        
-        return grad
+            return self.acc_buffer
+        return self.group.compute.grad
     
     def reset(self) -> None:
         """optimizer step 后调用，清掉累加 buffer。"""

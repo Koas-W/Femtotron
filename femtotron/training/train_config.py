@@ -1,6 +1,8 @@
 import torch
 from dataclasses import dataclass
 
+from femtotron.sharding.factory import ZeROConfig
+
 @dataclass
 class TrainConfig:
 
@@ -26,7 +28,11 @@ class TrainConfig:
     reduce_dtype: torch.dtype | None = None              # 梯度通信精度，None 表示和 grad 一致
     
 
-    sharding: str = "none"    # 未来: "ddp", "zero1", "zero2", "zero3", "fsdp"
+    #####################################################
+    # ZeRO-1 2 3（FSDP）相关
+    #####################################################
+    ZeRO_config: ZeROConfig = ZeROConfig(0)
+    # sharding: str = "none"    # 未来: "ddp", "zero1", "zero2", "zero3", "fsdp"
 
     use_loss_scaler: bool = False     # fp16 才开
     initial_scale: float = 2.0 ** 16

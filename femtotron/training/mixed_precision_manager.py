@@ -14,6 +14,8 @@ from femtotron.training.train_config import TrainConfig
 from femtotron.training.param_group import ParamGroup
 from femtotron.training.grad_accumulator import GradAccumulator
 from femtotron.training.grad_transform import GradTransform
+from femtotron.sharding.sharding_strategy import ShardingStrategy
+from femtotron.sharding.no_shard import NoShardStrategy
 
 class MixedPrecisionManager:
     """
@@ -35,6 +37,7 @@ class MixedPrecisionManager:
                  inner_optimizer_kwargs: dict,
                  compute_param_groups: list[dict], # 用于区分weight_decay的param groups
                  grad_transforms: list[GradTransform] | None = None,
+                 sharding_strategy: ShardingStrategy | None = None,    # 默认 None
                  ):
         """
         参数：
@@ -62,6 +65,12 @@ class MixedPrecisionManager:
         - BF16 参数的 .grad 在 backward 后会被填充（BF16 梯度）
         - optimizer step 前需要把 BF16 梯度拷贝到 FP32 master weight 的 .grad 上
         """
+        self.parallel_ctx = parallel_ctx
+        # 默认走 NoShardStrategy，等价于 ZeRO 关闭
+        if sharding_strategy is None:
+            sharding_strategy = NoShardStrategy(parallel_ctx.dp_group)
+        self.strategy = sharding_strategy
+
         # 先从 compute_param_groups 建立映射：param id → 该 group 的配置（除了 params 以外的所有 key）
         param_to_group_meta = {}
         for compute_group in compute_param_groups:
@@ -74,11 +83,16 @@ class MixedPrecisionManager:
         self.groups: list[ParamGroup] = []
         params = model.named_parameters()
         for name, p in params:
-            master = self._make_master(p, config) if config.master_dtype else None
+            # master = self._make_master(p, config) if config.master_dtype else None
+            if config.master_dtype:
+                master, spec = self.strategy.make_master(p, config.master_dtype)
+            else:
+                master, spec = None, None
             opt_config = param_to_group_meta.get(id(p), {})
             self.groups.append(ParamGroup(name=name, 
                                           compute=p, 
                                           master=master, 
+                                          master_spec=spec,
                                           opt_config=opt_config, 
                                           parallel_ctx=parallel_ctx,
                                           parallel_plan=parallel_plan))
@@ -122,8 +136,7 @@ class MixedPrecisionManager:
     
     def copy_grads_to_master(self):
         """
-        将模型 BF16 参数的梯度拷贝到对应的 FP32 master weight 上。
-        同时也会进行相应的grad_transform的梯度链操作。
+        收集所有参数的 grad，通过 strategy 同步并 cast 到 master，装到 master.grad，应用 transforms。
         
         调用时机：backward 完成后，optimizer.step() 之前。
         
@@ -131,22 +144,46 @@ class MixedPrecisionManager:
         对每对 (bf16_param, fp32_master):
             if bf16_param.grad is not None:
                 fp32_master.grad = bf16_param.grad.float()
-            
-        为什么需要这一步：
-        backward 产生的梯度挂在 BF16 参数上（因为 forward 用的是 BF16 参数），
-        但 optimizer 操作的是 FP32 master weights。
-        需要把梯度"搬"过去，同时提升精度到 FP32。
+                
+        （可选）Returns:
+            装好的 grad 列表（用于 transform 后的 logging,如 grad_norm 等)。
         """
-        # 1. 收集 finalized grads
-        grads: list[Tensor] = []
-        for ga, group in zip(self.grad_accs, self.groups):
-            grad = ga.finalize()
-            if grad is None:
-                grad = torch.zeros_like(group.optimized_param)
-            group.optimized_param.grad = grad
-            grads.append(grad)
-
-        self.grad_transform(grads=grads)
+        # 1. 各 ParamGroup 调 finalize 拿本地 grad（bf16, 完整形状）
+        local_grads: list[Tensor | None] = []
+        for ga in self.grad_accs:
+            local_grads.append(ga.finalize())
+        
+        # 2. 处理 None grad（缺梯度的参数装零张量，保证 inner.step 能正常跑）
+        targets = [g.optimized_param for g in self.groups]
+        specs = [g.master_spec for g in self.groups]
+        
+        filled_local_grads = [
+            g if g is not None else torch.zeros_like(t)
+            for g, t in zip(local_grads, targets)
+        ]
+        # 注意：这里的 zeros_like(t) 在 ZeRO 下 shape 是分片大小——但 strategy.reduce_grads
+        # 期望接收 *完整* compute_param 形状的 grad，不是分片大小。所以要按 compute 形状填零：
+        filled_local_grads = [
+            g if g is not None else torch.zeros_like(group.compute)
+            for g, group in zip(local_grads, self.groups)
+        ]
+        
+        # 3. 通过 strategy 做通信 + cast 到 master_dtype
+        #    - NoShardStrategy: cast（all-reduce 由独立的 grad_sync 组件做）
+        #    - ZeRO1Strategy:   reduce_scatter + cast
+        synced_grads = self.strategy.reduce_grads(
+            compute_grads=filled_local_grads,
+            targets=targets,
+            target_specs=specs,
+        )
+        
+        # 4. 装到 optimized_param.grad 上
+        for group, grad in zip(self.groups, synced_grads):
+            group.assign_grad(grad)
+        
+        # 5. 应用 grad transforms（clip 等）
+        self.grad_transform(grads=synced_grads)
+        # return synced_grads
     
     def grad_transform(self, grads: list[Tensor]) -> list[torch.Tensor]:
         """
@@ -175,8 +212,7 @@ class MixedPrecisionManager:
         optimizer 在 FP32 master weights 上做了更新（param -= lr * grad），
         但下一步 forward 用的是模型的 BF16 参数，需要同步。
         """
-        for g in self.groups:
-            g.sync_master_to_compute()
+        self.strategy.gather_weights(self.groups)
     
     def zero_grad(self):
         """
@@ -193,17 +229,16 @@ class MixedPrecisionManager:
     
     def step(self) -> bool:
         """完成一个 optimizer step。返回是否成功（fp16 下可能因溢出跳过）。"""
-        # 1. 收集 finalized grads
-        # 2. 应用 grad transforms（unscale、clip 等）
+        # 1. 收集 + 同步 + transform，装到 master.grad
         self.copy_grads_to_master()
         
-        # 4. 真正 step
+        # 2. inner optimizer 在 master 上做更新
         self.inner.step()
         
-        # 5. master → compute 同步
+        # 3. master → compute（NoShardStrategy 是本地 cast；ZeRO1 是 all_gather）
         self.sync_weights()
         
-        # 6. 清理
+        # 4. 清理 grads（compute 和 master 两边的）
         self.zero_grad()
         return True
     
@@ -230,6 +265,11 @@ class MixedPrecisionManager:
                 if g.master is not None
             },
             
+            # 新增：每个 master 的 sharding spec
+            "master_specs": {
+                g.name: g.master_spec for g in self.groups if g.master_spec is not None
+            },
+        
             # 内部 optimizer 状态（Adam m/v、step 计数等）
             "inner_optimizer": self.inner.state_dict(),
             
@@ -245,6 +285,11 @@ class MixedPrecisionManager:
                 "param_dtype": str(self.config.param_dtype),
                 "num_groups": len(self.groups),
                 "param_names": [g.name for g in self.groups],
+                            
+                # 新增：分布式拓扑信息
+                "dp_size": self.parallel_ctx.dp_size,
+                "tp_size": self.parallel_ctx.tp_size,
+                "sharding_strategy_kind": type(self.strategy).__name__,    # "NoShardStrategy" / "ZeRO1Strategy"
             },
         }
 
@@ -255,7 +300,8 @@ class MixedPrecisionManager:
         否则 master 会从未初始化的 compute 重建，覆盖 ckpt 内容。
         """
         # 1. 版本和配置一致性
-        assert sd.get("version") == 1, f"unsupported checkpoint version: {sd.get('version')}"
+        version = sd.get("version", 1)
+        assert version <= 2, f"unsupported checkpoint version: {sd.get('version')}"
         
         ckpt_cfg = sd["config"]
         assert ckpt_cfg["num_groups"] == len(self.groups), (
@@ -267,6 +313,26 @@ class MixedPrecisionManager:
             f"master_dtype mismatch: ckpt={ckpt_cfg['master_dtype']}, current={expected_dtype}"
         )
         
+        # 新增的拓扑一致性检查
+        if version >= 2:
+            ckpt_dp = ckpt_cfg.get("dp_size")
+            ckpt_strategy = ckpt_cfg.get("sharding_strategy_kind")
+            current_strategy = type(self.strategy).__name__
+            
+            # ZeRO 配置必须一致——shard 切法不同，无法直接 resume
+            assert ckpt_strategy == current_strategy, (
+                f"sharding strategy mismatch: ckpt={ckpt_strategy}, current={current_strategy}; "
+                f"cannot resume across different ZeRO stages without reshard"
+            )
+            
+            # ZeRO 启用时 dp_size 必须一致
+            if current_strategy != "NoShardStrategy":
+                assert ckpt_dp == self.parallel_ctx.dp_size, (
+                    f"dp_size mismatch under {current_strategy}: ckpt={ckpt_dp}, "
+                    f"current={self.parallel_ctx.dp_size}; "
+                    f"resharding across dp_size requires DCP-style checkpoint"
+                )
+
         current_names = [g.name for g in self.groups]
         if ckpt_cfg["param_names"] != current_names:
             # 给个有用的诊断信息
@@ -279,6 +345,7 @@ class MixedPrecisionManager:
             )
         
         # 2. 恢复 FP32 master weights
+        # 恢复 master weights（每个都是本 rank 的 shard，shape 和当前 master 应该一致）
         master_weights = sd["master_weights"]
         for g in self.groups:
             if g.master is None:
@@ -289,10 +356,27 @@ class MixedPrecisionManager:
             if ckpt_w.shape != g.master.shape:
                 raise RuntimeError(
                     f"shape mismatch for {g.name}: "
-                    f"ckpt={tuple(ckpt_w.shape)}, current={tuple(g.master.shape)}"
+                    f"ckpt={tuple(ckpt_w.shape)}, current={tuple(g.master.shape)}; "
+                    f"likely caused by changed sharding configuration"
                 )
             with torch.no_grad():
                 g.master.copy_(ckpt_w.to(g.master.device))
+        
+        # 验证 spec 一致性（v2+）
+        if version >= 2 and "master_specs" in sd:
+            for g in self.groups:
+                ckpt_spec = sd["master_specs"].get(g.name)
+                if ckpt_spec is not None and g.master_spec is not None:
+                    # 关键字段要一致
+                    assert ckpt_spec.full_shape == g.master_spec.full_shape, (
+                        f"full_shape mismatch for {g.name}"
+                    )
+                    assert ckpt_spec.world_size == g.master_spec.world_size, (
+                        f"world_size mismatch for {g.name}"
+                    )
+                    assert ckpt_spec.rank == g.master_spec.rank, (
+                        f"rank mismatch for {g.name} — likely loading wrong shard file"
+                    )
         
         # 3. 恢复 inner optimizer 状态
         self.inner.load_state_dict(sd["inner_optimizer"])

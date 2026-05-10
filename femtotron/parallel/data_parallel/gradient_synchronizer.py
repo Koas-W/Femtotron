@@ -14,6 +14,9 @@ from femtotron.parallel_context import ParallelContext
 from femtotron.training.param_group import ParamGroup
 from femtotron.model.shard_loader import ShardLoader, ReplicateLoader, DimShardLoader, _LOADER_REGISTRY
 from femtotron.parallel.data_parallel.ddp import DataParallelGradSync
+from femtotron.sharding.sharding_strategy import ShardingStrategy
+from femtotron.sharding.no_shard import NoShardStrategy
+from femtotron.sharding.zero1 import ZeRO1Strategy
 
 class GradientSynchronizer(Protocol):
     """
@@ -62,7 +65,14 @@ class NoOpGradSync:
 def create_grad_synchronizer(
     param_groups: list[ParamGroup],
     parallel_ctx: ParallelContext,
+    sharding_strategy: ShardingStrategy, 
 ) -> GradientSynchronizer:
+    # 如果 strategy 已经处理了 grad sync（ZeRO 系列），grad_sync 是 NoOp
+    if sharding_strategy.grads_are_dp_sharded():
+        return NoOpGradSync()
+    
+    # 否则用独立的 DDP grad sync
     if parallel_ctx.dp_group is None or parallel_ctx.dp_size == 1:
         return NoOpGradSync()
+    
     return DataParallelGradSync(param_groups, parallel_ctx)
