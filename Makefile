@@ -106,9 +106,17 @@ endif
 
 test-integration: test-dp-training # test-tp-training test-pp-training test-3d-parallel
 
-# 1.5 DDP 训练（待实现后取消注释）
+# 1.5 DDP 训练
+# test-dp-training:
+# 	@echo -e "$(YELLOW)>>> [跳过] DDP 训练测试 (待 1.5 实现)$(NC)"
 test-dp-training:
-	@echo -e "$(YELLOW)>>> [跳过] DDP 训练测试 (待 1.5 实现)$(NC)"
+	@echo -e "$(YELLOW)>>> 测试 DP 训练一致性 (2卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_dp_training.py
+ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
+	@echo -e "$(YELLOW)>>> 测试 DP 训练一致性 (4卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_dp_training.py
+endif
+	@echo -e "$(GREEN)  DP Training ✓$(NC)"
 
 # test-tp-training:
 # 	@echo -e "$(YELLOW)>>> 测试 TP 训练一致性 (2卡)$(NC)"
