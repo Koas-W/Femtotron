@@ -104,7 +104,7 @@ endif
 # 集成测试（后续开发时逐步添加）
 # ============================================================
 
-test-integration: test-dp-training # test-tp-training test-pp-training test-3d-parallel
+test-integration: test-dp-training test-gradient-accum # test-tp-training test-pp-training test-3d-parallel
 
 # 1.5 DDP 训练
 # test-dp-training:
@@ -118,6 +118,11 @@ ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
 endif
 	@echo -e "$(GREEN)  DP Training ✓$(NC)"
 
+test-gradient-accum:
+	@echo -e "$(YELLOW)>>> 测试梯度累积一致性 (2卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_gradient_accum.py
+	@echo -e "$(GREEN)  Gradient Accumulation ✓$(NC)"
+	
 # test-tp-training:
 # 	@echo -e "$(YELLOW)>>> 测试 TP 训练一致性 (2卡)$(NC)"
 # 	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_tp_training.py
