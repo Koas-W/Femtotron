@@ -74,7 +74,7 @@ class ZeRO2Strategy:
     
     def reduce_grads(
         self,
-        compute_grads: list[Tensor | None],     # ZeRO-2 下基本都是 None(hook 清掉了)
+        compute_grads: list[Tensor],
         targets: list[Tensor],
         target_specs: list[ShardingSpec | None],
     ) -> list[Tensor]:

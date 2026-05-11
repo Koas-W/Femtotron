@@ -34,28 +34,16 @@ class ShardingStrategy(Protocol):
     
     def reduce_grads(
         self,
-        compute_grads: list[Tensor | None],     # ZeRO-2 下基本都是 None(hook 清掉了)
-        targets: list[Tensor],
-        target_specs: list[ShardingSpec | None],
-    ) -> list[Tensor]:
-        """backward 完成后调用。
-        
-        NoShard:  cast 到 master dtype（通信由 grad_sync 做）
-        ZeRO-1:   reduce_scatter + cast
-        ZeRO-2:   只从 grad shard buffer 拿出来（hook 已经 reduce_scatter 过了）
-        """
-        ...
-
-    def reduce_grads(
-        self,
         compute_grads: list[Tensor],     # 各 rank 完整的 bf16 grad
         targets: list[Tensor],            # ParamGroup.optimized_param
         target_specs: list[ShardingSpec | None],
     ) -> list[Tensor]:
         """把完整 grad 同步成"每个 rank 看到自己 master 的那部分 grad"。
         
-        - 无 ZeRO：all-reduce，返回完整 grad
-        - ZeRO-1：reduce-scatter，返回本 rank 那段 grad
+        无 ZeRO：all-reduce，返回完整 grad
+        NoShard:  cast 到 master dtype（通信由 grad_sync 做）
+        ZeRO-1:   reduce_scatter + cast
+        ZeRO-2:   只从 grad shard buffer 拿出来（hook 已经 reduce_scatter 过了）
         """
         ...
     
