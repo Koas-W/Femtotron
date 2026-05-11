@@ -104,7 +104,7 @@ endif
 # 集成测试（后续开发时逐步添加）
 # ============================================================
 
-test-integration: test-dp-training test-gradient-accum test-zero1 # test-tp-training test-pp-training test-3d-parallel
+test-integration: test-dp-training test-gradient-accum test-zero1-2 # test-tp-training test-pp-training test-3d-parallel
 
 # 1.5 DDP 训练
 # test-dp-training:
@@ -123,16 +123,16 @@ test-gradient-accum:
 	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_gradient_accum.py
 	@echo -e "$(GREEN)  Gradient Accumulation ✓$(NC)"
 	
-test-zero1:
+test-zero1-2:
 ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
 	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 正确性 (4卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_zero1.py
+	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_zero1_2.py
 else ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
 	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 正确性 (2卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_zero1.py
+	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_zero1_2.py
 endif
 	@echo -e "$(GREEN)  ZeRO-1 ✓$(NC)"
-	
+
 # test-tp-training:
 # 	@echo -e "$(YELLOW)>>> 测试 TP 训练一致性 (2卡)$(NC)"
 # 	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_tp_training.py

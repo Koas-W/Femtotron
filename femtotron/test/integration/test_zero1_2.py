@@ -172,6 +172,7 @@ def verify_master_sharding(mp_manager, dp_size):
     return True, "所有参数分片正确"
 
 def test_zero1_correctness(world_size, device):
+    passed = True
     log("\n" + "=" * 60)
     log("ZeRO-1 正确性测试")
     log(f"World size: {world_size}")
@@ -224,102 +225,148 @@ def test_zero1_correctness(world_size, device):
 
     # ============ ZeRO-1:zero_stage=1 ============
     log("\n--- 跑 ZeRO-1 (zero_stage=1) ---")
-    model_z, mp_z, sync_z, strat_z = create_model_and_optimizer(
+    model_z1, mp_z1, sync_z1, strat_z1 = create_model_and_optimizer(
         model_config, parallel_ctx, device, zero_stage=1, seed=42
     )
-    inspect_master_shapes(mp_z, "zero1")
+    inspect_master_shapes(mp_z1, "zero1")
 
     # master 分片 shape 验证
-    shard_ok, shard_msg = verify_master_sharding(mp_z, dp_size)
-    log(f"  Master 分片验证: {'✓' if shard_ok else '✗'} {shard_msg}")
-    if not shard_ok:
+    shard_ok_z1, shard_msg_z1 = verify_master_sharding(mp_z1, dp_size)
+    log(f"  Master 分片验证: {'✓' if shard_ok_z1 else '✗'} {shard_msg_z1}")
+    if not shard_ok_z1:
         passed = False   # 需要把 passed 提前初始化，或者存起来后面汇总
 
-    losses_z, mem_z = run_n_steps(
-        model_z, mp_z, sync_z, parallel_ctx, device,
+    losses_z1, mem_z1 = run_n_steps(
+        model_z1, mp_z1, sync_z1, parallel_ctx, device,
         num_steps=num_steps, micro_batch_size=micro_batch_size,
         seq_len=seq_len, vocab_size=model_config.vocab_size,
     )
 
-    log(f"\n  ZeRO-1 strategy: {type(strat_z).__name__}")
-    log(f"  ZeRO-1 grad_sync: {type(sync_z).__name__}")
-    log(f"  ZeRO-1 峰值显存: {mem_z:.3f} GB")
+    log(f"\n  ZeRO-1 strategy: {type(strat_z1).__name__}")
+    log(f"  ZeRO-1 grad_sync: {type(sync_z1).__name__}")
+    log(f"  ZeRO-1 峰值显存: {mem_z1:.3f} GB")
 
     # 在最后一个 step 后检查 weight 一致性
-    weights_ok, weight_diff = verify_weights_consistent_across_dp(model_z, parallel_ctx)
+    weights_ok_z1, weight_diff_z1 = verify_weights_consistent_across_dp(model_z1, parallel_ctx)
+    
+    del model_z1, mp_z1, sync_z1, strat_z1
+    torch.cuda.empty_cache()
+    dist.barrier()
 
-    del model_z, mp_z, sync_z, strat_z
+    # ============ ZeRO-2:zero_stage=2 ============
+    log("\n--- 跑 ZeRO-2 (zero_stage=2) ---")
+    model_z2, mp_z2, sync_z2, strat_z2 = create_model_and_optimizer(
+        model_config, parallel_ctx, device, zero_stage=2, seed=42
+    )
+    inspect_master_shapes(mp_z2, "zero2")
+    strat_z2.prepare_for_backward(mp_z2.groups)
+
+    # master 分片 shape 验证
+    shard_ok_z2, shard_msg_z2 = verify_master_sharding(mp_z2, dp_size)
+    log(f"  Master 分片验证: {'✓' if shard_ok_z2 else '✗'} {shard_msg_z2}")
+    if not shard_ok_z2:
+        passed = False   # 需要把 passed 提前初始化，或者存起来后面汇总
+
+    losses_z2, mem_z2 = run_n_steps(
+        model_z2, mp_z2, sync_z2, parallel_ctx, device,
+        num_steps=num_steps, micro_batch_size=micro_batch_size,
+        seq_len=seq_len, vocab_size=model_config.vocab_size,
+    )
+
+    log(f"\n  ZeRO-2 strategy: {type(strat_z2).__name__}")
+    log(f"  ZeRO-2 grad_sync: {type(sync_z2).__name__}")
+    log(f"  ZeRO-2 峰值显存: {mem_z2:.3f} GB")
+
+    # 在最后一个 step 后检查 weight 一致性
+    weights_ok_z2, weight_diff_z2 = verify_weights_consistent_across_dp(model_z2, parallel_ctx)
+
+    del model_z2, mp_z2, sync_z2, strat_z2
     torch.cuda.empty_cache()
     dist.barrier()
 
     # ============ 对比 ============
-    passed = True
 
     if dist.get_rank() == 0:
         log(f"\n{'=' * 60}")
         log("结果对比")
         log(f"{'=' * 60}")
 
-        # 1. Loss 一致性
-        log(f"\n[1] Loss 一致性 (baseline vs zero1)")
-        log(f"  {'Step':>6} {'Baseline':>12} {'ZeRO-1':>12} {'Diff':>12}")
-        log(f"  {'─' * 46}")
-        max_loss_diff = 0.0
+        # 1. Loss 一致性(三方对比)
+        log(f"\n[1] Loss 一致性 (baseline vs ZeRO-1 vs ZeRO-2)")
+        log(f"  {'Step':>6} {'Baseline':>12} {'ZeRO-1':>12} {'ZeRO-2':>12} {'D1':>10} {'D2':>10}")
+        log(f"  {'─' * 64}")
+        max_diff_z1 = 0.0
+        max_diff_z2 = 0.0
         for i in range(num_steps):
-            diff = abs(losses_b[i] - losses_z[i])
-            max_loss_diff = max(max_loss_diff, diff)
+            d1 = abs(losses_b[i] - losses_z1[i])
+            d2 = abs(losses_b[i] - losses_z2[i])
+            max_diff_z1 = max(max_diff_z1, d1)
+            max_diff_z2 = max(max_diff_z2, d2)
             if i % 2 == 0 or i == num_steps - 1:
-                log(f"  {i+1:>6} {losses_b[i]:>12.6f} {losses_z[i]:>12.6f} {diff:>12.8f}")
+                log(
+                    f"  {i+1:>6} {losses_b[i]:>12.6f} {losses_z1[i]:>12.6f} {losses_z2[i]:>12.6f} "
+                    f"{d1:>10.6f} {d2:>10.6f}"
+                )
 
-        # 第一步 loss 应该完全相同(weight 还没被分片更新过,forward 完全一致)
-        first_step_diff = abs(losses_b[0] - losses_z[0])
-        first_step_ok = first_step_diff < 1e-4
-        log(f"\n  第一步 diff: {first_step_diff:.8f} {'✓' if first_step_ok else '✗'} (期望 < 1e-4)")
+        # 第一步 loss 应该完全相同(weight 还没被分片更新过)
+        first_diff_z1 = abs(losses_b[0] - losses_z1[0])
+        first_diff_z2 = abs(losses_b[0] - losses_z2[0])
+        first_z1_ok = first_diff_z1 < 1e-4
+        first_z2_ok = first_diff_z2 < 1e-4
+        log(f"\n  第一步 diff ZeRO-1: {first_diff_z1:.8f} {'✓' if first_z1_ok else '✗'} (期望 < 1e-4)")
+        log(f"  第一步 diff ZeRO-2: {first_diff_z2:.8f} {'✓' if first_z2_ok else '✗'} (期望 < 1e-4)")
 
         # 后续步骤允许小误差(reduce_scatter vs all_reduce 浮点累加顺序差异)
         loss_threshold = 0.02
-        loss_ok = max_loss_diff < loss_threshold
-        log(f"  最大 diff:    {max_loss_diff:.8f} {'✓' if loss_ok else '✗'} (threshold {loss_threshold})")
+        loss_z1_ok = max_diff_z1 < loss_threshold
+        loss_z2_ok = max_diff_z2 < loss_threshold
+        log(f"  最大 diff ZeRO-1:   {max_diff_z1:.8f} {'✓' if loss_z1_ok else '✗'} (threshold {loss_threshold})")
+        log(f"  最大 diff ZeRO-2:   {max_diff_z2:.8f} {'✓' if loss_z2_ok else '✗'} (threshold {loss_threshold})")
 
-        if not (first_step_ok and loss_ok):
+        if not (first_z1_ok and first_z2_ok and loss_z1_ok and loss_z2_ok):
             passed = False
 
-        # 2. 显存对比
+        # 2. 显存对比(三方对比 + 节省层次)
         log(f"\n[2] 显存对比")
-        mem_savings = (mem_b - mem_z) / mem_b * 100 if mem_b > 0 else 0
         log(f"  Baseline: {mem_b:.3f} GB")
-        log(f"  ZeRO-1:   {mem_z:.3f} GB")
-        log(f"  节省:     {mem_savings:.1f}%")
+        log(f"  ZeRO-1:   {mem_z1:.3f} GB  (节省 {(mem_b - mem_z1) / mem_b * 100:>5.1f}% vs baseline)")
+        log(f"  ZeRO-2:   {mem_z2:.3f} GB  (节省 {(mem_b - mem_z2) / mem_b * 100:>5.1f}% vs baseline,"
+            f" {(mem_z1 - mem_z2) / mem_z1 * 100:>5.1f}% vs ZeRO-1)")
 
-        # ZeRO-1 应该明显省显存。tiny model 上节省比例不会很大(激活占大头),
-        # 但至少应该比 baseline 小一点。
-        mem_ok = mem_z < mem_b
-        log(f"  {'✓' if mem_ok else '✗'} ZeRO-1 < Baseline")
-        if not mem_ok:
+        # 期望:ZeRO-1 < Baseline(省 optimizer state),ZeRO-2 < ZeRO-1(额外省 grad)
+        mem_z1_ok = mem_z1 < mem_b
+        mem_z2_ok = mem_z2 < mem_z1
+        log(f"  {'✓' if mem_z1_ok else '✗'} ZeRO-1 < Baseline  (optimizer state 应被分片)")
+        log(f"  {'✓' if mem_z2_ok else '✗'} ZeRO-2 < ZeRO-1    (grad 应被额外分片)")
+        if not mem_z1_ok:
+            log(f"  ⚠️  ZeRO-1 没省显存,master 可能没真的分片")
             passed = False
-            log(f"  ⚠️  显存没省下来,说明 master 可能没真的分片")
-
-        # 3. Weight 一致性
-        log(f"\n[3] DP rank 间 weight 一致性 (ZeRO-1 gather_weights 后)")
-        log(f"  最大 diff: {weight_diff:.8f}")
-        log(f"  {'✓' if weights_ok else '✗'} 所有 dp rank weight 一致 (< 1e-5)")
-        if not weights_ok:
+        if not mem_z2_ok:
+            log(f"  ⚠️  ZeRO-2 没省下额外显存,hook 可能没正确释放 compute.grad")
             passed = False
 
-        # 4. Loss 下降
+        # 3. Weight 一致性(ZeRO-1 和 ZeRO-2 都要检查)
+        log(f"\n[3] DP rank 间 weight 一致性 (gather_weights 后)")
+        log(f"  ZeRO-1 最大 diff: {weight_diff_z1:.8f}  {'✓' if weights_ok_z1 else '✗'}")
+        log(f"  ZeRO-2 最大 diff: {weight_diff_z2:.8f}  {'✓' if weights_ok_z2 else '✗'}")
+        if not (weights_ok_z1 and weights_ok_z2):
+            passed = False
+
+        # 4. Loss 下降检查(三方都要下降)
         log(f"\n[4] Loss 下降检查")
-        for name, losses in [("baseline", losses_b), ("zero1", losses_z)]:
+        for name, losses in [("baseline", losses_b), ("zero1", losses_z1), ("zero2", losses_z2)]:
             first_3 = sum(losses[:3]) / 3
             last_3 = sum(losses[-3:]) / 3
             decreasing = last_3 < first_3
-            log(f"  {'✓' if decreasing else '✗'} {name}: {first_3:.4f} → {last_3:.4f}")
+            log(f"  {'✓' if decreasing else '✗'} {name:>8}: {first_3:.4f} → {last_3:.4f}")
             if not decreasing:
                 passed = False
         
         # 5. Master 分片验证
         log(f"\n[5] Master 分片 shape 验证")
-        log(f"  {'✓' if shard_ok else '✗'} {shard_msg}")
-        if not shard_ok:
+        log(f"  {'✓' if shard_ok_z1 else '✗'} {shard_msg_z1} (ZeRO-1)")
+        log(f"  {'✓' if shard_ok_z2 else '✗'} {shard_msg_z2} (ZeRO-2)")
+        if not (shard_ok_z1 and shard_ok_z2):
             passed = False
 
     # 同步结果

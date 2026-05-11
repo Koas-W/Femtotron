@@ -226,6 +226,8 @@ class MixedPrecisionManager:
             target = g.master if g.master is not None else g.compute
             target.grad = None
 
+        # 让 strategy 清理自己的状态
+        self.strategy.post_step()
     
     def step(self) -> bool:
         """完成一个 optimizer step。返回是否成功（fp16 下可能因溢出跳过）。"""

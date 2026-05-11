@@ -24,10 +24,32 @@ class ShardingStrategy(Protocol):
         """从 compute 创建 master，返回 (master_tensor, spec)。"""
         ...
     
+    def prepare_for_backward(self, groups: list[ParamGroup]) -> None:
+        """backward 之前调用,注册 hook、分配 grad shard buffer 等。
+        
+        NoShard / ZeRO-1: 不做任何事
+        ZeRO-2: 给每个 param 注册 post-accumulate-grad hook
+        """
+        ...
+    
+    def reduce_grads(
+        self,
+        compute_grads: list[Tensor | None],     # ZeRO-2 下基本都是 None(hook 清掉了)
+        targets: list[Tensor],
+        target_specs: list[ShardingSpec | None],
+    ) -> list[Tensor]:
+        """backward 完成后调用。
+        
+        NoShard:  cast 到 master dtype（通信由 grad_sync 做）
+        ZeRO-1:   reduce_scatter + cast
+        ZeRO-2:   只从 grad shard buffer 拿出来（hook 已经 reduce_scatter 过了）
+        """
+        ...
+
     def reduce_grads(
         self,
         compute_grads: list[Tensor],     # 各 rank 完整的 bf16 grad
-        targets: list[Tensor],            # ParamHandle.optimized_param
+        targets: list[Tensor],            # ParamGroup.optimized_param
         target_specs: list[ShardingSpec | None],
     ) -> list[Tensor]:
         """把完整 grad 同步成"每个 rank 看到自己 master 的那部分 grad"。
@@ -55,3 +77,5 @@ class ShardingStrategy(Protocol):
         - ZeRO-1/2/3：True（grad 经过 reduce_scatter，每 rank 只有一段）
         """
         ...
+
+    def post_step(self) -> None: ...    # 对zero1是no-op，但 zero2 需要在 step 之后清理 grad shard buffer

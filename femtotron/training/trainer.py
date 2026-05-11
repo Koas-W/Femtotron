@@ -117,6 +117,9 @@ class Trainer:
                 if global_step >= config.train_steps:
                     return
         """
+        # 启动前让 strategy 准备 backward(注册 hook 等)
+        self.mp_manager.strategy.prepare_for_backward(self.mp_manager.groups)
+        
         while self.global_step < self.train_config.train_steps:
             self.dataloader.set_epoch(self.epoch)
             

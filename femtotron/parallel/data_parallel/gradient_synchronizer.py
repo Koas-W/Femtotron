@@ -17,6 +17,7 @@ from femtotron.parallel.data_parallel.ddp import DataParallelGradSync
 from femtotron.sharding.sharding_strategy import ShardingStrategy
 from femtotron.sharding.no_shard import NoShardStrategy
 from femtotron.sharding.zero1 import ZeRO1Strategy
+from femtotron.sharding.zero2 import ZeRO2Strategy
 
 class GradientSynchronizer(Protocol):
     """
@@ -60,13 +61,21 @@ class NoOpGradSync:
     def no_sync(self) -> AbstractContextManager[None]:
         return nullcontext()
     def state_dict(self): return {}
-    def load_state_dict(self, sd): pass
+    def load_state_dict(self, sd: dict): pass
 
 def create_grad_synchronizer(
     param_groups: list[ParamGroup],
     parallel_ctx: ParallelContext,
     sharding_strategy: ShardingStrategy, 
 ) -> GradientSynchronizer:
+    # ZeRO-2/3 既是 strategy 又是 grad_sync——它持有 no_sync 状态,
+    # 需要把 grad_sync 接口暴露出去
+    # if isinstance(sharding_strategy, ZeRO3Strategy):
+    #     return sharding_strategy
+
+    if isinstance(sharding_strategy, ZeRO2Strategy):
+        return sharding_strategy    # strategy 本身就是 grad_sync
+    
     # 如果 strategy 已经处理了 grad sync（ZeRO 系列），grad_sync 是 NoOp
     if sharding_strategy.grads_are_dp_sharded():
         return NoOpGradSync()

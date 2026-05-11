@@ -33,9 +33,12 @@ class ZeRO1Strategy:
         master_shard.requires_grad_(True)
         return master_shard, spec
     
+    def prepare_for_backward(self, groups: list[ParamGroup]) -> None:
+        pass
+    
     def reduce_grads(self,
         compute_grads: list[Tensor],     # 各 rank 完整的 bf16 grad
-        targets: list[Tensor],            # ParamHandle.optimized_param
+        targets: list[Tensor],            # ParamGroup.optimized_param
         target_specs: list[ShardingSpec | None],
         ):
         """对每个 grad 做 reduce-scatter。
@@ -93,3 +96,6 @@ class ZeRO1Strategy:
     
     def grads_are_dp_sharded(self) -> bool:
         return True
+    
+    def post_step(self) -> None:
+        pass

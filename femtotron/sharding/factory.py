@@ -15,6 +15,7 @@ from femtotron.parallel_context import ParallelContext
 from femtotron.sharding.sharding_strategy import ShardingStrategy
 from femtotron.sharding.no_shard import NoShardStrategy
 from femtotron.sharding.zero1 import ZeRO1Strategy
+from femtotron.sharding.zero2 import ZeRO2Strategy
 from femtotron.sharding.zero_config import ZeROConfig
 
 def create_sharding_strategy(
@@ -26,8 +27,9 @@ def create_sharding_strategy(
     elif config.stage == 1:
         assert parallel_ctx.dp_group is not None
         return ZeRO1Strategy(parallel_ctx.dp_group)
-    # elif config.stage == 2:
-    #     return ZeRO2Strategy(...)    # 未实现
+    elif config.stage == 2:
+        assert parallel_ctx.dp_group is not None
+        return ZeRO2Strategy(parallel_ctx.dp_group)   # ← 新增
     # elif config.stage == 3:
     #     return ZeRO3Strategy(...)    # 未实现
     raise ValueError(config.stage)
