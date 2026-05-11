@@ -156,6 +156,20 @@ def inspect_master_shapes(mp_manager, label):
         sharded = "(sharded)" if g.is_master_sharded else "(replicated)"
         log(f"    {g.name}: compute={compute_shape}, master={master_shape} {sharded}")
 
+def verify_master_sharding(mp_manager, dp_size):
+    """验证 ZeRO-1 下 master 确实被分片了。"""
+    for g in mp_manager.groups:
+        if g.is_master_sharded:
+            master_numel = g.master.numel()
+            compute_numel = g.compute.numel()
+            expected_numel = (compute_numel + dp_size - 1) // dp_size
+            if master_numel != expected_numel:
+                return False, f"{g.name}: master {master_numel} != expected {expected_numel}"
+        else:
+            # 非分片参数的 master 应该和 compute 大小一致
+            if g.master is not None and g.master.numel() != g.compute.numel():
+                return False, f"{g.name}: non-sharded but sizes differ"
+    return True, "所有参数分片正确"
 
 def test_zero1_correctness(world_size, device):
     log("\n" + "=" * 60)
@@ -169,8 +183,9 @@ def test_zero1_correctness(world_size, device):
     seq_len = 32
 
     # 并行配置:dp_size 至少 2 才能看出 ZeRO-1 效果
-    tp_size = min(world_size, 4)
-    while model_config.num_key_value_heads % tp_size != 0:
+    max_tp = world_size // 2  # 预留至少 2 给 DP
+    tp_size = min(max_tp, 4)
+    while tp_size > 1 and model_config.num_key_value_heads % tp_size != 0:
         tp_size -= 1
     dp_size = world_size // tp_size
 
@@ -213,6 +228,12 @@ def test_zero1_correctness(world_size, device):
         model_config, parallel_ctx, device, zero_stage=1, seed=42
     )
     inspect_master_shapes(mp_z, "zero1")
+
+    # master 分片 shape 验证
+    shard_ok, shard_msg = verify_master_sharding(mp_z, dp_size)
+    log(f"  Master 分片验证: {'✓' if shard_ok else '✗'} {shard_msg}")
+    if not shard_ok:
+        passed = False   # 需要把 passed 提前初始化，或者存起来后面汇总
 
     losses_z, mem_z = run_n_steps(
         model_z, mp_z, sync_z, parallel_ctx, device,
@@ -294,6 +315,12 @@ def test_zero1_correctness(world_size, device):
             log(f"  {'✓' if decreasing else '✗'} {name}: {first_3:.4f} → {last_3:.4f}")
             if not decreasing:
                 passed = False
+        
+        # 5. Master 分片验证
+        log(f"\n[5] Master 分片 shape 验证")
+        log(f"  {'✓' if shard_ok else '✗'} {shard_msg}")
+        if not shard_ok:
+            passed = False
 
     # 同步结果
     passed_tensor = torch.tensor([1 if passed else 0], device="cuda")
@@ -305,6 +332,90 @@ def test_zero1_correctness(world_size, device):
     log(f"{'=' * 60}")
     return passed
 
+def test_zero1_with_grad_accum(world_size, device):
+    """ZeRO-1 + 梯度累积兼容性冒烟测试。"""
+    log("\n" + "=" * 60)
+    log("ZeRO-1 + 梯度累积兼容性测试")
+    log("=" * 60)
+
+    model_config = get_tiny_config()
+
+    max_tp = world_size // 2  # 预留至少 2 给 DP
+    tp_size = min(max_tp, 4)
+    while tp_size > 1 and model_config.num_key_value_heads % tp_size != 0:
+        tp_size -= 1
+    dp_size = world_size // tp_size
+
+    if dp_size < 2:
+        log("  跳过（dp_size < 2）")
+        return True
+
+    parallel_ctx = ParallelContext(OrderedDict([("dp", dp_size), ("tp", tp_size)]))
+
+    model, mp_manager, grad_sync, strat = create_model_and_optimizer(
+        model_config, parallel_ctx, device, zero_stage=1, seed=42
+    )
+    model.train()
+
+    num_steps = 5
+    accum_steps = 2
+    mbs = 4
+    seq_len = 32
+    vocab_size = model_config.vocab_size
+
+    losses = []
+
+    for step in range(num_steps):
+        step_loss = 0.0
+
+        for micro_step in range(accum_steps):
+            torch.manual_seed(step * accum_steps + micro_step + 5000)
+            data = torch.randint(0, vocab_size, (mbs, seq_len), device=device)
+
+            is_last = (micro_step == accum_steps - 1)
+            sync_ctx = nullcontext() if is_last else grad_sync.no_sync()
+
+            with sync_ctx:
+                outputs = model(input_ids=data, labels=data)
+                loss = outputs["loss"] / accum_steps
+                loss.backward()
+                step_loss += loss.detach().float().item() * accum_steps
+
+        grad_sync.sync_gradients()
+        mp_manager.step()
+
+        avg_loss = step_loss / accum_steps
+        losses.append(avg_loss)
+        log(f"  Step {step+1}: loss = {avg_loss:.6f}")
+
+    passed = True
+
+    # 无 NaN
+    has_nan = any(not torch.isfinite(torch.tensor(l)) for l in losses)
+    log(f"  {'✓' if not has_nan else '✗'} 无 NaN/Inf")
+    passed &= not has_nan
+
+    # Loss 合理
+    expected = torch.tensor(vocab_size, dtype=torch.float).log().item()
+    init_ok = abs(losses[0] - expected) < 2.0
+    log(f"  {'✓' if init_ok else '✗'} 初始 loss {losses[0]:.4f} ≈ ln({vocab_size}) = {expected:.4f}")
+    passed &= init_ok
+
+    # Weight 一致性
+    weights_ok, weight_diff = verify_weights_consistent_across_dp(model, parallel_ctx)
+    log(f"  {'✓' if weights_ok else '✗'} DP rank 间 weight 一致 (diff={weight_diff:.8f})")
+    passed &= weights_ok
+
+    del model, mp_manager, grad_sync, strat
+    torch.cuda.empty_cache()
+
+    # 同步
+    passed_tensor = torch.tensor([1 if passed else 0], device="cuda")
+    dist.broadcast(passed_tensor, src=0)
+    passed = passed_tensor.item() == 1
+
+    log(f"  {'✓ 测试通过' if passed else '✗ 测试失败'}")
+    return passed
 
 def main():
     local_rank = init_distributed()
@@ -318,7 +429,10 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print("=" * 60)
 
-    passed = test_zero1_correctness(world_size, device)
+    passed = True
+    passed &= test_zero1_correctness(world_size, device)
+    dist.barrier()
+    passed &= test_zero1_with_grad_accum(world_size, device)
 
     dist.destroy_process_group()
     sys.exit(0 if passed else 1)
