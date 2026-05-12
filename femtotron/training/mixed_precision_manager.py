@@ -162,6 +162,20 @@ class MixedPrecisionManager:
         self.grad_transforms = grad_transforms or []
         # self.loss_scaler = loss_scaler
     
+    def cleanup(self):
+        # 先让 strategy 卸 hook
+        if hasattr(self.strategy, 'cleanup'):
+            self.strategy.cleanup()
+        # 这两个是释放 m, v 的关键
+        self.inner.state.clear()
+        self.inner.param_groups.clear()
+        # 其他可能持有 tensor 引用的容器
+        if hasattr(self, 'opt_targets'):
+            self.opt_targets.clear()
+        if hasattr(self, 'clusters'):
+            self.clusters.clear()
+        self.groups.clear()
+
     @staticmethod
     def _make_master(p: nn.Parameter, config: TrainConfig) -> Tensor:
         m = p.detach().clone().to(config.master_dtype)

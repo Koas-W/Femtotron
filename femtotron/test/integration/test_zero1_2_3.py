@@ -5,6 +5,7 @@ import torch.distributed as dist
 from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
+import gc
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -114,6 +115,24 @@ def create_model_and_optimizer(model_config, parallel_ctx, device, zero_stage=0,
     return model, mp_manager, grad_sync, sharding_strategy
 
 
+def clean_slate(label: str = ""):
+    """彻底清理 GPU,准备下一个测试。"""
+    gc.collect()                              # 触发 cyclic GC,处理循环引用
+    torch.cuda.empty_cache()                   # 把 cached 内存还给 driver
+    torch.cuda.synchronize()                   # 确保所有 kernel 完成
+    torch.cuda.reset_peak_memory_stats()       # 重置峰值计数器
+    
+    allocated_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+    if dist.get_rank() == 0:
+        print(f"  [clean_slate {label}] active after cleanup: {allocated_mb:.1f} MB")
+    
+    # Sanity check:期望接近 0
+    if allocated_mb > 100:
+        print(f"  [WARN] {allocated_mb:.1f} MB 没释放干净,测量可能被污染")
+    
+    return allocated_mb
+
+
 def run_n_steps(model, mp_manager, grad_sync, parallel_ctx,
                 device, num_steps=10, micro_batch_size=8,
                 seq_len=32, vocab_size=1024):
@@ -169,7 +188,7 @@ def verify_weights_consistent_across_dp(model, parallel_ctx):
 
 def inspect_master_shapes(mp_manager, label):
     """打印前几个参数的 master shape,直观确认是否分片。"""
-    log(f"\n  [{label}] master 形状采样:")
+    log(f"\n  [{label}] master shape sample result:")
     for i, g in enumerate(mp_manager.groups[:3]):
         compute_shape = tuple(g.compute.shape)
         master_shape = tuple(g.master.shape) if g.master is not None else None
@@ -189,7 +208,7 @@ def verify_master_sharding(mp_manager, dp_size):
             # 非分片参数的 master 应该和 compute 大小一致
             if g.master is not None and g.master.numel() != g.compute.numel():
                 return False, f"{g.name}: non-sharded but sizes differ"
-    return True, "所有参数分片正确"
+    return True, "all parameter sharded correctly"
 
 def test_zero1_correctness(world_size, device):
     passed = True
@@ -223,7 +242,9 @@ def test_zero1_correctness(world_size, device):
     log(f"并行配置: DP={dp_size}, TP={tp_size}")
 
     # ============ Baseline:zero_stage=0 ============
-    log("\n--- 跑 baseline (zero_stage=0) ---")
+    zero_stage = 0
+    clean_slate(f"before stage{zero_stage}")
+    log("\n--- baseline (zero_stage=0) ---")
     model_b, mp_b, sync_b, strat_b = create_model_and_optimizer(
         model_config, parallel_ctx, device, zero_stage=0, seed=42
     )
@@ -237,14 +258,16 @@ def test_zero1_correctness(world_size, device):
 
     log(f"\n  Baseline strategy: {type(strat_b).__name__}")
     log(f"  Baseline grad_sync: {type(sync_b).__name__}")
-    log(f"  Baseline 峰值显存: {mem_b:.3f} GB")
+    log(f"  Baseline peak memory: {mem_b:.3f} GB")
 
     del model_b, mp_b, sync_b, strat_b
     torch.cuda.empty_cache()
     dist.barrier()
 
     # ============ ZeRO-1:zero_stage=1 ============
-    log("\n--- 跑 ZeRO-1 (zero_stage=1) ---")
+    zero_stage = 1
+    clean_slate(f"before stage{zero_stage}")
+    log("\n--- ZeRO-1 (zero_stage=1) ---")
     model_z1, mp_z1, sync_z1, strat_z1 = create_model_and_optimizer(
         model_config, parallel_ctx, device, zero_stage=1, seed=42
     )
@@ -252,7 +275,7 @@ def test_zero1_correctness(world_size, device):
 
     # master 分片 shape 验证
     shard_ok_z1, shard_msg_z1 = verify_master_sharding(mp_z1, dp_size)
-    log(f"  Master 分片验证: {'✓' if shard_ok_z1 else '✗'} {shard_msg_z1}")
+    log(f"  Master sharding verification: {'✓' if shard_ok_z1 else '✗'} {shard_msg_z1}")
     if not shard_ok_z1:
         passed = False   # 需要把 passed 提前初始化，或者存起来后面汇总
 
@@ -264,17 +287,21 @@ def test_zero1_correctness(world_size, device):
 
     log(f"\n  ZeRO-1 strategy: {type(strat_z1).__name__}")
     log(f"  ZeRO-1 grad_sync: {type(sync_z1).__name__}")
-    log(f"  ZeRO-1 峰值显存: {mem_z1:.3f} GB")
+    log(f"  ZeRO-1 peak memory: {mem_z1:.3f} GB")
 
     # 在最后一个 step 后检查 weight 一致性
     weights_ok_z1, weight_diff_z1 = verify_weights_consistent_across_dp(model_z1, parallel_ctx)
     
+    mp_z1.cleanup()
     del model_z1, mp_z1, sync_z1, strat_z1
     torch.cuda.empty_cache()
+    gc.collect()
     dist.barrier()
 
     # ============ ZeRO-2:zero_stage=2 ============
-    log("\n--- 跑 ZeRO-2 (zero_stage=2) ---")
+    zero_stage = 2
+    clean_slate(f"before stage{zero_stage}")
+    log("\n--- ZeRO-2 (zero_stage=2) ---")
     model_z2, mp_z2, sync_z2, strat_z2 = create_model_and_optimizer(
         model_config, parallel_ctx, device, zero_stage=2, seed=42
     )
@@ -283,7 +310,7 @@ def test_zero1_correctness(world_size, device):
 
     # master 分片 shape 验证
     shard_ok_z2, shard_msg_z2 = verify_master_sharding(mp_z2, dp_size)
-    log(f"  Master 分片验证: {'✓' if shard_ok_z2 else '✗'} {shard_msg_z2}")
+    log(f"  Master sharding verification: {'✓' if shard_ok_z2 else '✗'} {shard_msg_z2}")
     if not shard_ok_z2:
         passed = False   # 需要把 passed 提前初始化，或者存起来后面汇总
 
@@ -295,17 +322,41 @@ def test_zero1_correctness(world_size, device):
 
     log(f"\n  ZeRO-2 strategy: {type(strat_z2).__name__}")
     log(f"  ZeRO-2 grad_sync: {type(sync_z2).__name__}")
-    log(f"  ZeRO-2 峰值显存: {mem_z2:.3f} GB")
+    log(f"  ZeRO-2 peak memory: {mem_z2:.3f} GB")
 
     # 在最后一个 step 后检查 weight 一致性
     weights_ok_z2, weight_diff_z2 = verify_weights_consistent_across_dp(model_z2, parallel_ctx)
 
+    # report_cuda_tensors("after ZeRO-2 run, before cleanup", min_mb=1.0)
+    mp_z2.cleanup()
+    # report_cuda_tensors("after manual cleanup, before del", min_mb=1.0)
+    # # 1. 找一个 leaked MLP 参数
+    # trace_leak((2048, 1024), torch.bfloat16, max_depth=4)
+    # if dist.get_rank() == 0:
+    #     print()
+
+    # # 2. 找一个 leaked master shard
+    # trace_leak((1048576,), torch.float32, max_depth=4)
+    # if dist.get_rank() == 0:
+    #     print()
+    
     del model_z2, mp_z2, sync_z2, strat_z2
+    gc.collect()
     torch.cuda.empty_cache()
+    # # 在 cleanup 之后调
+    # if dist.get_rank() == 0:
+    #     find_strategy_holders()
+    #     count_alive_instances()
+    #     trace_instance_referrers('MixedPrecisionManager')
+    #     trace_instance_referrers('GradAccumulator')
+    #     trace_instance_referrers('LlamaModel')
     dist.barrier()
+    # report_cuda_tensors("after del+gc+empty_cache", min_mb=1.0)
 
     # ============ ZeRO-3:zero_stage=3 ============
-    log("\n--- 跑 ZeRO-3 (zero_stage=3) ---")
+    zero_stage = 3
+    clean_slate(f"before stage{zero_stage}")
+    log("\n--- ZeRO-3 (zero_stage=3) ---")
     model_z3, mp_z3, sync_z3, strat_z3 = create_model_and_optimizer(
         model_config, parallel_ctx, device, zero_stage=3, seed=42,
     )
@@ -322,7 +373,14 @@ def test_zero1_correctness(world_size, device):
         seq_len=seq_len, vocab_size=model_config.vocab_size,
     )
 
-    log(f"  ZeRO-3 峰值显存: {mem_z3:.3f} GB")
+    log(f"  ZeRO-3 peak memory: {mem_z3:.3f} GB")
+    
+    mp_z3.cleanup()
+    del model_z3, mp_z3, sync_z3, strat_z3
+    torch.cuda.empty_cache()
+    gc.collect()
+    dist.barrier()
+
     # ============ 对比 ============
 
     if dist.get_rank() == 0:
@@ -533,6 +591,289 @@ def main():
     dist.destroy_process_group()
     sys.exit(0 if passed else 1)
 
+import gc
+import torch
+
+def list_cuda_storages(min_mb=1.0):
+    """枚举所有 Python 可见的 CUDA storage,按 storage 去重(避免 view 重复)。"""
+    seen = {}  # storage_ptr -> {'size_mb', 'tensors': [...]}
+    
+    for obj in gc.get_objects():
+        try:
+            if not torch.is_tensor(obj):
+                continue
+            if not obj.is_cuda:
+                continue
+            try:
+                storage = obj.untyped_storage()
+                ptr = storage.data_ptr()
+                nbytes = storage.nbytes()
+            except Exception:
+                continue
+            
+            if ptr not in seen:
+                seen[ptr] = {
+                    'size_mb': nbytes / (1024**2),
+                    'tensors': [],
+                }
+            seen[ptr]['tensors'].append({
+                'shape': tuple(obj.shape),
+                'dtype': str(obj.dtype).replace('torch.', ''),
+                'is_leaf': obj.is_leaf,
+                'requires_grad': obj.requires_grad,
+                'is_param': isinstance(obj, torch.nn.Parameter),
+            })
+        except Exception:
+            continue
+    
+    big = [(info['size_mb'], info['tensors']) for info in seen.values() if info['size_mb'] >= min_mb]
+    big.sort(key=lambda x: x[0], reverse=True)
+    return big
+
+
+def report_cuda_tensors(label, min_mb=1.0):
+    if dist.get_rank() != 0:
+        return
+    storages = list_cuda_storages(min_mb=min_mb)
+    total = sum(s for s, _ in storages)
+    untracked = torch.cuda.memory_allocated() / 1024**2 - total
+    
+    print(f"\n=== {label} ===")
+    print(f"Tracked storages ≥ {min_mb} MB: {len(storages)} 个, 合计 {total:.1f} MB")
+    print(f"Allocator active total: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+    print(f"Untracked (cache/internal/small): {untracked:.1f} MB")
+    print()
+    
+    for size_mb, tensors in storages[:30]:
+        print(f"  [{size_mb:7.2f} MB] {len(tensors)} 个 view")
+        for t in tensors[:2]:
+            tag = "Parameter" if t['is_param'] else ("leaf" if t['is_leaf'] else "view")
+            print(f"             shape={t['shape']} {t['dtype']} {tag} grad={t['requires_grad']}")
+        if len(tensors) > 2:
+            print(f"             ... +{len(tensors)-2} 个其他 view")
+def trace_leak(shape, dtype, max_depth=4, max_per_level=3):
+    """找一个匹配 shape/dtype 的 leaked tensor,沿引用链回溯。"""
+    import sys
+    
+    # 1. 在 gc 里找匹配的 tensor
+    target = None
+    for obj in gc.get_objects():
+        try:
+            if (torch.is_tensor(obj) and obj.is_cuda
+                and tuple(obj.shape) == shape
+                and obj.dtype == dtype):
+                target = obj
+                break
+        except Exception:
+            continue
+    
+    if target is None:
+        print(f"没找到 shape={shape} dtype={dtype}")
+        return
+    
+    is_param = isinstance(target, torch.nn.Parameter)
+    print(f"\nTracing: shape={shape} dtype={dtype} is_param={is_param}\n")
+    
+    visited = {id(target)}
+    
+    def walk(obj, depth, indent):
+        if depth >= max_depth:
+            return
+        
+        # 过掉我们自己 frame 的 locals
+        my_locals = sys._getframe(0).f_locals
+        outer_locals = sys._getframe(1).f_locals
+        
+        refs = []
+        for r in gc.get_referrers(obj):
+            if r is my_locals or r is outer_locals:
+                continue
+            if id(r) in visited:
+                continue
+            refs.append(r)
+        
+        for ref in refs[:max_per_level]:
+            visited.add(id(ref))
+            cls = type(ref)
+            desc = f"{cls.__module__}.{cls.__qualname__}"
+            
+            extra = ""
+            if isinstance(ref, dict):
+                keys = list(ref.keys())[:6]
+                keys_str = [repr(k)[:40] for k in keys]
+                extra = f"  dict[{len(ref)}] keys={keys_str}"
+            elif isinstance(ref, (list, tuple)):
+                extra = f"  len={len(ref)}"
+            elif hasattr(ref, '__dict__'):
+                attrs = list(vars(ref).keys())[:5]
+                extra = f"  attrs={attrs}"
+            
+            print(f"{indent}└─ {desc}{extra}")
+            walk(ref, depth + 1, indent + "   ")
+        
+        if len(refs) > max_per_level:
+            print(f"{indent}   ... +{len(refs) - max_per_level} 个其他 referrer 未显示")
+    
+    walk(target, 0, "")
+    target = None
+def count_alive_instances():
+    """统计感兴趣的类型还活着多少个。"""
+    types_of_interest = {
+        # 模型类
+        'ColumnParallelLinear', 'RowParallelLinear', 'VocabParallelEmbedding',
+        'LlamaDecoderLayer', 'LlamaMLP', 'LlamaAttention', 'LlamaForCausalLM',
+        'LlamaRMSNorm', 'LlamaModel',
+        # femtotron 训练框架
+        'MixedPrecisionManager', 'ParamGroup', 'GradAccumulator',
+        'ZeRO1Strategy', 'ZeRO2Strategy', 'ZeRO3Strategy',
+        'ParamGroupCluster', 'NoShardStrategy',
+        # PyTorch
+        'AdamW', 'Adam',
+    }
+    
+    counts = {}
+    for obj in gc.get_objects():
+        try:
+            t = type(obj).__name__
+            if t in types_of_interest:
+                counts[t] = counts.get(t, 0) + 1
+        except Exception:
+            continue
+    
+    if dist.get_rank() != 0:
+        return
+    print("\n=== 活着的对象计数 ===")
+    if not counts:
+        print("  ✓ 没有相关对象残留")
+        return
+    for t in sorted(counts):
+        print(f"  {t}: {counts[t]}")
+        
+def trace_instance_referrers(type_name, max_depth=2, max_per_level=5):
+    """找到这个类型的实例,沿引用链回溯。"""
+    import sys, types
+    
+    target = None
+    for obj in gc.get_objects():
+        try:
+            if type(obj).__name__ == type_name:
+                target = obj
+                break
+        except Exception:
+            continue
+    
+    if target is None:
+        print(f"No {type_name} alive")
+        return
+    
+    if dist.get_rank() != 0:
+        return
+    
+    print(f"\n=== Who holds {type_name}? ===")
+    
+    def describe(obj):
+        cls = type(obj)
+        name = f"{cls.__module__}.{cls.__qualname__}"
+        if isinstance(obj, dict):
+            keys = list(obj.keys())[:6]
+            return f"{name} keys={[repr(k)[:40] for k in keys]}"
+        if isinstance(obj, (list, tuple)):
+            return f"{name}[{len(obj)}]"
+        if isinstance(obj, types.FrameType):
+            return f"FRAME {obj.f_code.co_filename}:{obj.f_lineno} in {obj.f_code.co_name}"
+        if hasattr(obj, '__dict__'):
+            attrs = list(vars(obj).keys())[:5]
+            return f"{name} attrs={attrs}"
+        return name
+    
+    visited = {id(target)}
+    
+    def walk(obj, depth, indent):
+        if depth >= max_depth:
+            return
+        my_locals = sys._getframe(0).f_locals
+        outer_locals = sys._getframe(1).f_locals if sys._getframe(1) else None
+        
+        refs = []
+        for r in gc.get_referrers(obj):
+            if r is my_locals or r is outer_locals:
+                continue
+            if id(r) in visited:
+                continue
+            refs.append(r)
+        
+        for r in refs[:max_per_level]:
+            visited.add(id(r))
+            print(f"{indent}← {describe(r)}")
+            walk(r, depth + 1, indent + "  ")
+        if len(refs) > max_per_level:
+            print(f"{indent}  ... +{len(refs)-max_per_level} 其他 referrer")
+    
+    walk(target, 0, "")
+    target = None
+
+def find_strategy_holders():
+    """找到活着的 ZeRO2Strategy,dump 它的状态 + 谁拽着它。"""
+    import sys
+    
+    strat = None
+    for obj in gc.get_objects():
+        if type(obj).__name__ == 'ZeRO2Strategy':
+            strat = obj
+            break
+    
+    if strat is None or dist.get_rank() != 0:
+        return
+    
+    # ─── strategy 内部状态(确认 cleanup 真的执行了) ───
+    print("\n=== ZeRO2Strategy 内部状态 ===")
+    for k, v in vars(strat).items():
+        size = f" len={len(v)}" if hasattr(v, '__len__') else ""
+        val = ""
+        if isinstance(v, dict) and len(v) > 0:
+            val = f" first_key={list(v.keys())[0]!r}"
+        elif isinstance(v, (list, tuple)) and len(v) > 0:
+            val = f" first_elem_type={type(v[0]).__name__}"
+        print(f"  .{k}: {type(v).__name__}{size}{val}")
+    
+    # ─── 谁直接持有 strategy ───
+    print("\n=== 谁持有 ZeRO2Strategy ===")
+    my_locals = sys._getframe(0).f_locals
+    refs = [r for r in gc.get_referrers(strat) if r is not my_locals]
+    
+    print(f"Total referrers: {len(refs)}")
+    for i, r in enumerate(refs):
+        t = type(r)
+        desc = f"{t.__module__}.{t.__qualname__}"
+        
+        if t.__name__ == 'cell':       # 闭包变量!最可能是这个
+            try:
+                contents = r.cell_contents
+                desc += f" → cell_contents={type(contents).__name__}"
+                if isinstance(contents, type(strat)):
+                    desc += " (refers back to strategy)"
+            except ValueError:
+                desc += " (empty cell)"
+        elif isinstance(r, dict):
+            keys = list(r.keys())[:6]
+            desc += f"  dict[{len(r)}] keys={[repr(k)[:30] for k in keys]}"
+        elif isinstance(r, (list, tuple)):
+            desc += f"[{len(r)}]"
+        elif t.__name__ == 'function':
+            desc += f"  qualname={r.__qualname__}"
+        elif hasattr(r, '__dict__'):
+            attrs = list(vars(r).keys())[:5]
+            desc += f"  attrs={attrs}"
+        print(f"  [{i}] ← {desc}")
+        
+        # 再上一层:谁持有 referrer
+        sub_refs = gc.get_referrers(r)
+        sub_refs = [sr for sr in sub_refs if sr is not my_locals]
+        # 也过掉我们已知的(strategy 自己等)
+        sub_refs = [sr for sr in sub_refs if sr is not strat]
+        for sr in sub_refs[:3]:
+            sub_t = type(sr)
+            print(f"        ← {sub_t.__module__}.{sub_t.__qualname__}")
 
 if __name__ == "__main__":
     main()

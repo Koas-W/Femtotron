@@ -25,6 +25,7 @@ class ZeRO2Strategy:
         self._grad_shards: dict[str, Tensor] = {}
         self._group_by_param_id: dict[int, ParamGroup] = {}
         self.groups_ref: list[ParamGroup] = []
+        self._hook_handles: list = []
     
     # ─── ShardingStrategy 接口 ───
     
@@ -72,7 +73,9 @@ class ZeRO2Strategy:
             self._grad_shards[group.name] = shard
             param.grad = None    # 释放 compute.grad,这是 ZeRO-2 省显存的关键
         
-        group.compute.register_post_accumulate_grad_hook(hook)
+        handle = group.compute.register_post_accumulate_grad_hook(hook)
+        self._hook_handles.append(handle)
+        # group.compute.register_post_accumulate_grad_hook(hook)
     
     def reduce_grads(
         self,
@@ -140,3 +143,11 @@ class ZeRO2Strategy:
         master_dtype: torch.dtype | None,
         ) -> list["ParamGroupCluster"]:
         return []
+    
+    def cleanup(self):
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles.clear()
+        self._grad_shards.clear()
+        self._group_by_param_id.clear()
+        self.groups_ref.clear()

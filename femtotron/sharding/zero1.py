@@ -108,3 +108,6 @@ class ZeRO1Strategy:
         master_dtype: torch.dtype | None,
         ) -> list["ParamGroupCluster"]:
         return []
+    
+    def cleanup(self):
+        pass

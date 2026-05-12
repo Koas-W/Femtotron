@@ -63,3 +63,6 @@ class NoShardStrategy:
         master_dtype: torch.dtype | None,
         ) -> list["ParamGroupCluster"]:
         return []
+    
+    def cleanup(self):
+        pass

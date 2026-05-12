@@ -79,3 +79,6 @@ class ShardingStrategy(Protocol):
         """ZeRO-3 在此构造 cluster 并掏空对应 ParamGroup 的 master。
         其他 strategy 返回空列表。"""
         return []
+    
+    def cleanup(self):
+        pass

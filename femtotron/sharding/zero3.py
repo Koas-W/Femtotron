@@ -43,6 +43,8 @@ class ZeRO3Strategy:
         
         # 所有 cluster 的列表(make_clusters 时填充)
         self.clusters: list[ParamGroupCluster] = []
+        # gc 相关状态
+        self._hook_handles: list = []
         
         # GradientSynchronizer 状态
         self._sync_enabled = True
@@ -185,19 +187,22 @@ class ZeRO3Strategy:
         闭包捕获 cluster:lambda 中 cluster 是 free variable,
         循环里每次给不同的 cluster 注册不同的 hook。
         """
-        cluster.module.register_forward_pre_hook(
-            lambda module, args, c=cluster: c.unshard()
-        )
-        cluster.module.register_forward_hook(
-            lambda module, args, output, c=cluster: c.reshard()
-        )
-        cluster.module.register_full_backward_pre_hook(
-            lambda module, grad_output, c=cluster: c.unshard()
-        )
-        cluster.module.register_full_backward_hook(
-            lambda module, grad_input, grad_output, c=cluster:
-                self._after_unit_backward(c)
-        )
+        handles = [
+            cluster.module.register_forward_pre_hook(
+                lambda module, args, c=cluster: c.unshard()
+            ),
+            cluster.module.register_forward_hook(
+                lambda module, args, output, c=cluster: c.reshard()
+            ),
+            cluster.module.register_full_backward_pre_hook(
+                lambda module, grad_output, c=cluster: c.unshard()
+            ),
+            cluster.module.register_full_backward_hook(
+                lambda module, grad_input, grad_output, c=cluster:
+                    self._after_unit_backward(c)
+            ),
+        ]
+        self._hook_handles.extend(handles)
     
     def _after_unit_backward(self, cluster: ParamGroupCluster) -> None:
         """backward 完成后:可能 reduce_scatter,然后必定 reshard。
@@ -308,3 +313,16 @@ class ZeRO3Strategy:
             "total_sharded_params": sum(c.total_numel for c in self.clusters),
             "memory_per_cluster": [c.memory_footprint() for c in self.clusters],
         }
+    
+    def cleanup(self):
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles.clear()
+        # cluster 内的 tensor 都释放(防止 cluster 自己有循环引用)
+        for c in self.clusters:
+            c.master = None # type: ignore[attr-defined]
+            c.flat_param_shard = None # type: ignore[attr-defined]
+            c.flat_grad_shard = None # type: ignore[attr-defined]
+            if hasattr(c, 'param_views'):
+                c.param_views.clear()
+        self.clusters.clear()
