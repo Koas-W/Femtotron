@@ -1,3 +1,5 @@
+from typing import cast
+
 import torch
 from torch import Tensor
 import torch.distributed as dist
@@ -66,10 +68,10 @@ class ColumnParallelLinear(nn.Module):
         # 2. y_partial = F.linear(x, self.weight, self.bias)
         # 3. 如果 gather_output: y = GatherFromTPRegion(y_partial)
         # 4. 返回 y_partial 或 y
-        x = CopyToTPRegion.apply(x, self.group)
+        x = cast(Tensor, CopyToTPRegion.apply(x, self.group))
         y_partial = F.linear(x, self.weight, self.bias)
         if self.gather_output:
-            y = GatherFromTPRegion.apply(y_partial, self.group)
+            y = cast(Tensor, GatherFromTPRegion.apply(y_partial, self.group))
         else :
             y = y_partial
         return y
@@ -198,11 +200,11 @@ class RowParallelLinear(nn.Module):
         #    （bias 不切分，只在 all-reduce 之后加，避免重复加）
         # 5. 返回 y
         if self.scatter_input:
-            x_partial = ScatterToTPRegion.apply(x, self.group)
+            x_partial = cast(Tensor, ScatterToTPRegion.apply(x, self.group))
         else:
             x_partial = x
         y_partial = F.linear(x_partial, self.weight)
-        y = ReduceFromTPRegion.apply(y_partial, self.group)
+        y = cast(Tensor, ReduceFromTPRegion.apply(y_partial, self.group))
         if self.bias is not None:
             y = y + self.bias
         return y

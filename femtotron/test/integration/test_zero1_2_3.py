@@ -53,6 +53,21 @@ def get_tiny_config(vocab_size=1024):
         tie_word_embeddings=False,
     )
 
+def get_larger_config(vocab_size=1024):
+    return AutoConfig.for_model(
+        "llama",
+        hidden_size=1024,           # ↑ from 256
+        intermediate_size=4096,     # ↑ from 512
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        num_hidden_layers=8,        # ↑ from 2
+        max_position_embeddings=128,
+        vocab_size=vocab_size,
+        rms_norm_eps=1e-5,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+    )
+
 
 def create_model_and_optimizer(model_config, parallel_ctx, device, zero_stage=0, seed=42):
     """构造模型 + mp_manager + grad_sync。zero_stage=0 走 NoShard，=1 走 ZeRO-1。"""
@@ -73,7 +88,11 @@ def create_model_and_optimizer(model_config, parallel_ctx, device, zero_stage=0,
     compute_param_groups = get_param_groups(model, weight_decay=0.01)
 
     # ←—— 关键差异 1:构造 sharding strategy
-    zero_config = ZeROConfig(stage=zero_stage)
+    if zero_stage == 3:
+        from femtotron.sharding.wrap_policy import llama_wrap_policy
+        zero_config = ZeROConfig(stage=3, wrap_policy=llama_wrap_policy)
+    else:
+        zero_config = ZeROConfig(stage=zero_stage)
     sharding_strategy = create_sharding_strategy(parallel_ctx, zero_config)
 
     mp_manager = MixedPrecisionManager(
@@ -109,12 +128,13 @@ def run_n_steps(model, mp_manager, grad_sync, parallel_ctx,
     losses = []
     torch.cuda.reset_peak_memory_stats()
 
+    # 每步用相同 seed 生成全局数据,各 rank 取自己 slice
+    # 保证 baseline 和 zero1 看到完全一样的数据
+    torch.manual_seed(2000)
+    total_global = micro_batch_size * dp_size
+    global_data = torch.randint(0, vocab_size, (total_global, seq_len), device=device)
+
     for step in range(num_steps):
-        # 每步用相同 seed 生成全局数据,各 rank 取自己 slice
-        # 保证 baseline 和 zero1 看到完全一样的数据
-        torch.manual_seed(step + 2000)
-        total_global = micro_batch_size * dp_size
-        global_data = torch.randint(0, vocab_size, (total_global, seq_len), device=device)
 
         rank_start = dp_rank * micro_batch_size
         rank_data = global_data[rank_start : rank_start + micro_batch_size]
@@ -178,7 +198,7 @@ def test_zero1_correctness(world_size, device):
     log(f"World size: {world_size}")
     log("=" * 60)
 
-    model_config = get_tiny_config()
+    model_config = get_larger_config()
     num_steps = 10
     micro_batch_size = 8
     seq_len = 32
@@ -284,6 +304,25 @@ def test_zero1_correctness(world_size, device):
     torch.cuda.empty_cache()
     dist.barrier()
 
+    # ============ ZeRO-3:zero_stage=3 ============
+    log("\n--- 跑 ZeRO-3 (zero_stage=3) ---")
+    model_z3, mp_z3, sync_z3, strat_z3 = create_model_and_optimizer(
+        model_config, parallel_ctx, device, zero_stage=3, seed=42,
+    )
+    log(f"  Strategy: {type(strat_z3).__name__}")
+    log(f"  num clusters: {len(strat_z3.clusters)}")
+    log(f"  Cluster summary:")
+    for c in strat_z3.clusters:
+        log(f"    {c}")
+
+    # 不需要手动调 prepare_for_backward——hook 在 make_clusters 时已注册
+    losses_z3, mem_z3 = run_n_steps(
+        model_z3, mp_z3, sync_z3, parallel_ctx, device,
+        num_steps=num_steps, micro_batch_size=micro_batch_size,
+        seq_len=seq_len, vocab_size=model_config.vocab_size,
+    )
+
+    log(f"  ZeRO-3 峰值显存: {mem_z3:.3f} GB")
     # ============ 对比 ============
 
     if dist.get_rank() == 0:
@@ -292,38 +331,46 @@ def test_zero1_correctness(world_size, device):
         log(f"{'=' * 60}")
 
         # 1. Loss 一致性(三方对比)
-        log(f"\n[1] Loss 一致性 (baseline vs ZeRO-1 vs ZeRO-2)")
-        log(f"  {'Step':>6} {'Baseline':>12} {'ZeRO-1':>12} {'ZeRO-2':>12} {'D1':>10} {'D2':>10}")
-        log(f"  {'─' * 64}")
+        log(f"\n[1] Loss 一致性 (baseline vs ZeRO-1 vs ZeRO-2 vs ZeRO-3)")
+        log(f"  {'Step':>6} {'Baseline':>12} {'ZeRO-1':>12} {'ZeRO-2':>12} {'ZeRO-3':>12} {'D1':>10} {'D2':>10} {'D3':>10}")
+        log(f"  {'─' * 76}")
         max_diff_z1 = 0.0
         max_diff_z2 = 0.0
+        max_diff_z3 = 0.0
         for i in range(num_steps):
             d1 = abs(losses_b[i] - losses_z1[i])
             d2 = abs(losses_b[i] - losses_z2[i])
+            d3 = abs(losses_b[i] - losses_z3[i])
             max_diff_z1 = max(max_diff_z1, d1)
             max_diff_z2 = max(max_diff_z2, d2)
+            max_diff_z3 = max(max_diff_z3, d3)
             if i % 2 == 0 or i == num_steps - 1:
                 log(
-                    f"  {i+1:>6} {losses_b[i]:>12.6f} {losses_z1[i]:>12.6f} {losses_z2[i]:>12.6f} "
-                    f"{d1:>10.6f} {d2:>10.6f}"
+                    f"  {i+1:>6} {losses_b[i]:>12.6f} {losses_z1[i]:>12.6f} {losses_z2[i]:>12.6f} {losses_z3[i]:>12.6f} "
+                    f"{d1:>10.6f} {d2:>10.6f} {d3:>10.6f}"
                 )
 
         # 第一步 loss 应该完全相同(weight 还没被分片更新过)
         first_diff_z1 = abs(losses_b[0] - losses_z1[0])
         first_diff_z2 = abs(losses_b[0] - losses_z2[0])
+        first_diff_z3 = abs(losses_b[0] - losses_z3[0])
         first_z1_ok = first_diff_z1 < 1e-4
         first_z2_ok = first_diff_z2 < 1e-4
+        first_z3_ok = first_diff_z3 < 1e-4
         log(f"\n  第一步 diff ZeRO-1: {first_diff_z1:.8f} {'✓' if first_z1_ok else '✗'} (期望 < 1e-4)")
         log(f"  第一步 diff ZeRO-2: {first_diff_z2:.8f} {'✓' if first_z2_ok else '✗'} (期望 < 1e-4)")
+        log(f"  第一步 diff ZeRO-3: {first_diff_z3:.8f} {'✓' if first_z3_ok else '✗'} (期望 < 1e-4)")
 
         # 后续步骤允许小误差(reduce_scatter vs all_reduce 浮点累加顺序差异)
         loss_threshold = 0.02
         loss_z1_ok = max_diff_z1 < loss_threshold
         loss_z2_ok = max_diff_z2 < loss_threshold
+        loss_z3_ok = max_diff_z3 < loss_threshold
         log(f"  最大 diff ZeRO-1:   {max_diff_z1:.8f} {'✓' if loss_z1_ok else '✗'} (threshold {loss_threshold})")
         log(f"  最大 diff ZeRO-2:   {max_diff_z2:.8f} {'✓' if loss_z2_ok else '✗'} (threshold {loss_threshold})")
+        log(f"  最大 diff ZeRO-3:   {max_diff_z3:.8f} {'✓' if loss_z3_ok else '✗'} (threshold {loss_threshold})")
 
-        if not (first_z1_ok and first_z2_ok and loss_z1_ok and loss_z2_ok):
+        if not (first_z1_ok and first_z2_ok and first_z3_ok and loss_z1_ok and loss_z2_ok and loss_z3_ok):
             passed = False
 
         # 2. 显存对比(三方对比 + 节省层次)
@@ -332,6 +379,8 @@ def test_zero1_correctness(world_size, device):
         log(f"  ZeRO-1:   {mem_z1:.3f} GB  (节省 {(mem_b - mem_z1) / mem_b * 100:>5.1f}% vs baseline)")
         log(f"  ZeRO-2:   {mem_z2:.3f} GB  (节省 {(mem_b - mem_z2) / mem_b * 100:>5.1f}% vs baseline,"
             f" {(mem_z1 - mem_z2) / mem_z1 * 100:>5.1f}% vs ZeRO-1)")
+        log(f"  ZeRO-3:   {mem_z3:.3f} GB  (节省 {(mem_b - mem_z3) / mem_b * 100:>5.1f}% vs baseline,"
+            f" {(mem_z1 - mem_z3) / mem_z1 * 100:>5.1f}% vs ZeRO-1)")
 
         # 期望:ZeRO-1 < Baseline(省 optimizer state),ZeRO-2 < ZeRO-1(额外省 grad)
         mem_z1_ok = mem_z1 < mem_b

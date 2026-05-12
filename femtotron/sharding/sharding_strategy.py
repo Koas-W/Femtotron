@@ -12,7 +12,7 @@ from typing import cast, Protocol
 from femtotron.sharding.sharding_spec import ShardingSpec
 from femtotron.model.parallel_plan import ParallelPlan
 from femtotron.training.param_group import ParamGroup
-from femtotron.training.param_group_cluster import ParamGroupCluster
+from femtotron.sharding.param_group_cluster import ParamGroupCluster
 
 class ShardingStrategy(Protocol):
     """决定 ParamHandle 的分片方式和同步行为。"""
@@ -73,7 +73,7 @@ class ShardingStrategy(Protocol):
     def make_clusters(
         self,
         model: nn.Module,
-        param_groups: list[ParamGroup],
+        groups: list[ParamGroup],
         master_dtype: torch.dtype | None,
     ) -> list["ParamGroupCluster"]:
         """ZeRO-3 在此构造 cluster 并掏空对应 ParamGroup 的 master。

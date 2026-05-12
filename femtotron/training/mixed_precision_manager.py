@@ -12,7 +12,7 @@ from femtotron.parallel_context import ParallelContext
 from femtotron.model.parallel_plan import ParallelPlan
 from femtotron.training.train_config import TrainConfig
 from femtotron.training.param_group import ParamGroup
-from femtotron.training.param_group_cluster import ParamGroupCluster
+from femtotron.sharding.param_group_cluster import ParamGroupCluster
 from femtotron.training.grad_accumulator import GradAccumulator
 from femtotron.training.grad_transform import GradTransform
 from femtotron.sharding.sharding_strategy import ShardingStrategy
@@ -125,7 +125,7 @@ class MixedPrecisionManager:
         # Z3: 返回真正的 cluster 列表,并把对应 group 的 master 掏空
         self.clusters: list[ParamGroupCluster] = self.strategy.make_clusters(
             model=model,
-            param_groups=self.groups,
+            groups=self.groups,
             master_dtype=config.master_dtype,
         )
         
@@ -136,12 +136,14 @@ class MixedPrecisionManager:
         # 注意:opt_config 在 cluster 内部决定每个 view 的 wd 等,
         # 实现优雅地保留了 per-param 优化语义(weight_decay 等)
         opt_targets: list[tuple[ParamGroup, Tensor]] = []
-        for pg in self.groups:
-            master = pg.master            # 抽出来,类型 Tensor | None
-            if master is not None:        # 在局部变量上检查,触发类型收窄
-                opt_targets.append((pg, master))
-        for cluster in self.clusters:
-            opt_targets.extend(cluster.get_optimizable_views())
+        for g in self.groups:
+                if g.has_own_master and g.master is not None:
+                    opt_targets.append((g, g.master))
+                elif g.cluster is not None:
+                    view = g.cluster.param_views.get(g.name)
+                    if view is not None:
+                        opt_targets.append((g, view))
+                    # else:本 rank 没持有该 param 的 view,跳过
         self.opt_targets = opt_targets
         
         # 按 opt_config 聚合(weight_decay 自然分组)

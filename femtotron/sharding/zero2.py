@@ -12,7 +12,7 @@ from contextlib import contextmanager
 
 from femtotron.sharding.sharding_spec import ShardingSpec
 from femtotron.training.param_group import ParamGroup
-from femtotron.training.param_group_cluster import ParamGroupCluster
+from femtotron.sharding.param_group_cluster import ParamGroupCluster
 
 class ZeRO2Strategy:
     def __init__(self, dp_group: ProcessGroup):
@@ -136,7 +136,7 @@ class ZeRO2Strategy:
     def make_clusters(
         self,
         model: nn.Module,
-        param_groups: list[ParamGroup],
+        groups: list[ParamGroup],
         master_dtype: torch.dtype | None,
         ) -> list["ParamGroupCluster"]:
         return []

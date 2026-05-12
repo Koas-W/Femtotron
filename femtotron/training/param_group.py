@@ -8,7 +8,7 @@ from femtotron.training.train_config import TrainConfig
 from femtotron.model.parallel_plan import ParallelPlan
 from femtotron.parallel_context import ParallelContext
 from femtotron.sharding.sharding_spec import ShardingSpec
-from femtotron.training.param_group_cluster import ParamGroupCluster
+from femtotron.sharding.param_group_cluster import ParamGroupCluster
 
 class ParamGroup:
     """一个参数的多份物理存储。"""
@@ -76,6 +76,8 @@ class ParamGroup:
             self.tp_shard_dim = None
         
         self.is_replicated_across_dp = True
+
+        self.cluster = None
         
     def sync_master_to_compute(self) -> None:
         """master 更新后，把数值同步到 compute（cast + copy）。"""

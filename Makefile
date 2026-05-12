@@ -126,10 +126,10 @@ test-gradient-accum:
 test-zero1-2:
 ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
 	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 正确性 (4卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_zero1_2.py
+	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_zero1_2_3.py
 else ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
 	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 正确性 (2卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_zero1_2.py
+	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_zero1_2_3.py
 endif
 	@echo -e "$(GREEN)  ZeRO-1 ✓$(NC)"
 
