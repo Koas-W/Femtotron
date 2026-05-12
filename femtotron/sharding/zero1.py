@@ -11,6 +11,7 @@ from typing import cast, Protocol
 
 from femtotron.sharding.sharding_spec import ShardingSpec
 from femtotron.training.param_group import ParamGroup
+from femtotron.training.param_group_cluster import ParamGroupCluster
 
 class ZeRO1Strategy:
     """ZeRO-1：仅分片 master / optimizer state。"""
@@ -99,3 +100,11 @@ class ZeRO1Strategy:
     
     def post_step(self) -> None:
         pass
+    
+    def make_clusters(
+        self,
+        model: nn.Module,
+        param_groups: list[ParamGroup],
+        master_dtype: torch.dtype | None,
+        ) -> list["ParamGroupCluster"]:
+        return []

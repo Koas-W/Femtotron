@@ -12,6 +12,7 @@ from contextlib import contextmanager
 
 from femtotron.sharding.sharding_spec import ShardingSpec
 from femtotron.training.param_group import ParamGroup
+from femtotron.training.param_group_cluster import ParamGroupCluster
 
 class ZeRO2Strategy:
     def __init__(self, dp_group: ProcessGroup):
@@ -56,6 +57,7 @@ class ZeRO2Strategy:
                 return    # no_sync 期间放过
             if param.grad is None:
                 return
+            assert spec is not None, "ZeRO-2 hook 只能注册在分片了的 param 上。"
             
             flat = param.grad.flatten()
             if spec.pad_size > 0:
@@ -130,3 +132,11 @@ class ZeRO2Strategy:
     
     def load_state_dict(self, sd: dict):
         pass
+    
+    def make_clusters(
+        self,
+        model: nn.Module,
+        param_groups: list[ParamGroup],
+        master_dtype: torch.dtype | None,
+        ) -> list["ParamGroupCluster"]:
+        return []

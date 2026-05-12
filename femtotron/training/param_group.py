@@ -8,6 +8,7 @@ from femtotron.training.train_config import TrainConfig
 from femtotron.model.parallel_plan import ParallelPlan
 from femtotron.parallel_context import ParallelContext
 from femtotron.sharding.sharding_spec import ShardingSpec
+from femtotron.training.param_group_cluster import ParamGroupCluster
 
 class ParamGroup:
     """一个参数的多份物理存储。"""
@@ -17,6 +18,9 @@ class ParamGroup:
     master_spec: ShardingSpec | None  # master 的分片信息
     opt_config: dict = field(default_factory=dict)  # {"weight_decay": 0.01} 等
     
+    # zero-3 使用的字段，被哪个cluster接管
+    cluster: "ParamGroupCluster | None" = field(default=None, repr=False)
+
     # 这些字段靠ParallelPlan和ParallelContext
     is_tp_sharded: bool                    # 这个参数在 TP 维度上是否分片
     tp_shard_dim: int | None               # 沿哪个 dim 切分（用于反推全局形状）
@@ -96,6 +100,15 @@ class ParamGroup:
     def is_master_sharded(self) -> bool:
         return self.master_spec is not None and self.master_spec.world_size > 1
     
+    # 状态查询 properties
+    @property
+    def has_own_master(self) -> bool:
+        return self.master is not None
+    
+    @property
+    def is_clustered(self) -> bool:
+        return self.cluster is not None
+    
     def assign_grad(self, grad: Tensor | None) -> None:
         """grad 必须和 optimized_param 形状一致——
         ZeRO-1 下这意味着 grad 已经是分片的（reduce_scatter 后）。"""
@@ -136,3 +149,12 @@ class ParamGroup:
         full = unpadded.view(spec.full_shape).to(self.compute.dtype)
         with torch.no_grad():
             self.compute.copy_(full)
+
+    def zero_grad(self) -> None:
+        """清空本 group 的 master grad。
+        
+        注意:compute.grad 由 GradAccumulator.reset() 清理,不在这里处理。
+        PyTorch 设计上 compute.grad 是 autograd 引擎管理的,GradAccumulator 持有引用控制其生命周期。
+        """
+        target = self.master if self.master is not None else self.compute
+        target.grad = None

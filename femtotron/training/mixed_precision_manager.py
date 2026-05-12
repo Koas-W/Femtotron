@@ -12,10 +12,12 @@ from femtotron.parallel_context import ParallelContext
 from femtotron.model.parallel_plan import ParallelPlan
 from femtotron.training.train_config import TrainConfig
 from femtotron.training.param_group import ParamGroup
+from femtotron.training.param_group_cluster import ParamGroupCluster
 from femtotron.training.grad_accumulator import GradAccumulator
 from femtotron.training.grad_transform import GradTransform
 from femtotron.sharding.sharding_strategy import ShardingStrategy
 from femtotron.sharding.no_shard import NoShardStrategy
+from femtotron.sharding.sharding_spec import ShardingSpec
 
 class MixedPrecisionManager:
     """
@@ -111,12 +113,47 @@ class MixedPrecisionManager:
             GradAccumulator(g, config, parallel_ctx) for g in self.groups
         ]
         
-        # 内部 optimizer 看的是 master（如果有），否则看 compute
-        opt_param_groups = []
-        for key, params in config_to_params.items():
-            group_dict = {"params": params}
-            group_dict.update(dict(key))  # 还原 weight_decay 等配置
-            opt_param_groups.append(group_dict)
+        # # 内部 optimizer 看的是 master（如果有），否则看 compute
+        # opt_param_groups = []
+        # for key, params in config_to_params.items():
+        #     group_dict = {"params": params}
+        #     group_dict.update(dict(key))  # 还原 weight_decay 等配置
+        #     opt_param_groups.append(group_dict)
+        
+        # 让 strategy 决定是否构造 cluster
+        # NoShard / Z1 / Z2: 返回 []
+        # Z3: 返回真正的 cluster 列表,并把对应 group 的 master 掏空
+        self.clusters: list[ParamGroupCluster] = self.strategy.make_clusters(
+            model=model,
+            param_groups=self.groups,
+            master_dtype=config.master_dtype,
+        )
+        
+        # 收集 inner_optimizer 看到的"逻辑参数"
+        # - standalone group: (g.master, g.opt_config)
+        # - 被 cluster 接管的 group: (cluster 上的 view, g.opt_config)
+        #   ← Step 1 此分支为空(no clusters)
+        # 注意:opt_config 在 cluster 内部决定每个 view 的 wd 等,
+        # 实现优雅地保留了 per-param 优化语义(weight_decay 等)
+        opt_targets: list[tuple[ParamGroup, Tensor]] = []
+        for pg in self.groups:
+            master = pg.master            # 抽出来,类型 Tensor | None
+            if master is not None:        # 在局部变量上检查,触发类型收窄
+                opt_targets.append((pg, master))
+        for cluster in self.clusters:
+            opt_targets.extend(cluster.get_optimizable_views())
+        self.opt_targets = opt_targets
+        
+        # 按 opt_config 聚合(weight_decay 自然分组)
+        config_to_tensors = defaultdict(list)
+        for pg, tensor in opt_targets:
+            key = frozenset(pg.opt_config.items())
+            config_to_tensors[key].append(tensor)
+        
+        opt_param_groups = [
+            {"params": tensors, **dict(key)}
+            for key, tensors in config_to_tensors.items()
+        ]
         self.inner = inner_optimizer_cls(opt_param_groups, **inner_optimizer_kwargs)
         
         self.config = config
@@ -144,58 +181,79 @@ class MixedPrecisionManager:
         对每对 (bf16_param, fp32_master):
             if bf16_param.grad is not None:
                 fp32_master.grad = bf16_param.grad.float()
+        NoShard / Z1 / Z2 路径(self.clusters 为空):行为和原来完全一致。
+        ZeRO-3 路径:standalone phase 处理游离 param(若有),cluster phase 处理被接管的。
                 
         （可选）Returns:
             装好的 grad 列表（用于 transform 后的 logging,如 grad_norm 等)。
         """
-        # 1. 各 ParamGroup 调 finalize 拿本地 grad（bf16, 完整形状）
-        local_grads: list[Tensor | None] = []
-        for ga in self.grad_accs:
-            local_grads.append(ga.finalize())
+        # ============ Phase 1: standalone groups via strategy.reduce_grads ============
+        # 只处理 has_own_master 的 group。Cluster 接管的 group(master 是 None)跳过——
+        # 它们的 grad 在 hook 触发的 reduce_scatter_grads 里已经填到 flat_grad_shard。
         
-        # 2. 处理 None grad（缺梯度的参数装零张量，保证 inner.step 能正常跑）
-        targets = [g.optimized_param for g in self.groups]
-        specs = [g.master_spec for g in self.groups]
+        # 一次遍历构造三个对齐列表,每个都是 narrowed 类型
+        standalone_groups: list[ParamGroup] = []
+        standalone_masters: list[Tensor] = []
+        standalone_specs: list[ShardingSpec | None] = []
+        standalone_local_grads: list[Tensor | None] = []
+
+        for i, pg in enumerate(self.groups):
+            master = pg.master
+            if master is None:
+                continue
+            standalone_groups.append(pg)
+            standalone_masters.append(master)
+            standalone_specs.append(pg.master_spec)
+            standalone_local_grads.append(self.grad_accs[i].finalize())
+
+        if standalone_groups:
+            # zeros_like 兜底
+            filled: list[Tensor] = [
+                g if g is not None else torch.zeros_like(group.compute)
+                for g, group in zip(standalone_local_grads, standalone_groups)
+            ]
+            
+            synced = self.strategy.reduce_grads(
+                compute_grads=filled,
+                targets=standalone_masters,    # list[Tensor] ✓
+                target_specs=standalone_specs,
+            )
+            for pg, grad in zip(standalone_groups, synced):
+                pg.assign_grad(grad)
         
-        filled_local_grads = [
-            g if g is not None else torch.zeros_like(t)
-            for g, t in zip(local_grads, targets)
-        ]
-        # 注意：这里的 zeros_like(t) 在 ZeRO 下 shape 是分片大小——但 strategy.reduce_grads
-        # 期望接收 *完整* compute_param 形状的 grad，不是分片大小。所以要按 compute 形状填零：
-        filled_local_grads = [
-            g if g is not None else torch.zeros_like(group.compute)
-            for g, group in zip(local_grads, self.groups)
-        ]
+        # ============ Phase 2: clusters - 各自把 flat_grad_shard → master.grad ============
+        # NoShard / Z1 / Z2 下 self.clusters 为空,这个循环是 no-op。
+        for cluster in self.clusters:
+            cluster.populate_master_grad()
         
-        # 3. 通过 strategy 做通信 + cast 到 master_dtype
-        #    - NoShardStrategy: cast（all-reduce 由独立的 grad_sync 组件做）
-        #    - ZeRO1Strategy:   reduce_scatter + cast
-        synced_grads = self.strategy.reduce_grads(
-            compute_grads=filled_local_grads,
-            targets=targets,
-            target_specs=specs,
-        )
-        
-        # 4. 装到 optimized_param.grad 上
-        for group, grad in zip(self.groups, synced_grads):
-            group.assign_grad(grad)
-        
-        # 5. 应用 grad transforms（clip 等）
-        self.grad_transform(grads=synced_grads)
+        # ============ Phase 3: grad transforms over all master.grads ============
+        # transforms 接收 (logical_param_groups, logical_grads) 形式
+        # 注意:cluster 的 view.grad 是 master.grad 的 slice,在 transform 看来就是"该参数的 grad"
+        self.grad_transform()
         # return synced_grads
     
-    def grad_transform(self, grads: list[Tensor]) -> list[torch.Tensor]:
-        """
-        对梯度的变换链，其中包括的最主要的是
-        分布式感知的 gradient norm clipping。
-        """
-        # 2. 应用 grad transforms（unscale、clip 等）
-        r: list[Tensor] = []
-        for transform in self.grad_transforms:
-            r.append(transform(self.groups, grads))
+    def grad_transform(self) -> list[Tensor]:
+        """对所有 master grad(包括 cluster view 的 grad)应用变换链。
         
-        return r
+        transforms 内部按 ParamGroup 的 is_tp_sharded、opt_config 等元数据决定如何处理。
+        """
+        # 构造对齐的 (group, grad) 列表
+        # 用 opt_targets:它已经包含正确的 (ParamGroup, target_tensor) 对应关系
+        # target_tensor.grad 就是这个 ParamGroup 的逻辑 grad(不管来自 master 还是 view)
+        aligned_groups: list[ParamGroup] = []
+        aligned_grads: list[Tensor] = []
+        
+        for pg, target in self.opt_targets:
+            if target.grad is not None:
+                aligned_groups.append(pg)
+                aligned_grads.append(target.grad)
+        
+        # 应用每个 transform
+        results = []
+        for transform in self.grad_transforms:
+            results.append(transform(aligned_groups, aligned_grads))
+        
+        return results
     
     def sync_weights(self):
         """
@@ -213,6 +271,8 @@ class MixedPrecisionManager:
         但下一步 forward 用的是模型的 BF16 参数，需要同步。
         """
         self.strategy.gather_weights(self.groups)
+        for cluster in self.clusters:
+            cluster.sync_master_to_compute()
     
     def zero_grad(self):
         """
@@ -222,9 +282,19 @@ class MixedPrecisionManager:
         """
         for ga in self.grad_accs:
             ga.reset()
+        # for g in self.groups:
+        #     target = g.master if g.master is not None else g.compute
+        #     target.grad = None
+
+        # 用 ParamGroup.zero_grad() 替代原来散落的 target.grad = None
+        # 行为等价(都是清 master.grad 或 compute.grad)
         for g in self.groups:
-            target = g.master if g.master is not None else g.compute
-            target.grad = None
+            g.zero_grad()
+        
+        # 新增:cluster 清自己的状态(master.grad、view.grad、flat_grad_shard)
+        # NoShard / Z1 / Z2 下 clusters 为空,no-op。
+        for cluster in self.clusters:
+            cluster.zero_grad()
 
         # 让 strategy 清理自己的状态
         self.strategy.post_step()
