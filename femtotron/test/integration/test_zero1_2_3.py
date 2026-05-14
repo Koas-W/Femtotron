@@ -210,7 +210,7 @@ def verify_master_sharding(mp_manager, dp_size):
                 return False, f"{g.name}: non-sharded but sizes differ"
     return True, "all parameter sharded correctly"
 
-def test_zero1_correctness(world_size, device):
+def test_zero_correctness(world_size, device):
     passed = True
     log("\n" + "=" * 60)
     log("ZeRO-1 正确性测试")
@@ -486,15 +486,15 @@ def test_zero1_correctness(world_size, device):
     log(f"{'=' * 60}")
     return passed
 
-def test_zero1_with_grad_accum(world_size, device):
-    """ZeRO-1 + 梯度累积兼容性冒烟测试。"""
+def test_zero_with_grad_accum(world_size, device, zero_stage):
+    """ZeRO + 梯度累积兼容性冒烟测试。"""
     log("\n" + "=" * 60)
-    log("ZeRO-1 + 梯度累积兼容性测试")
+    log(f"ZeRO-{zero_stage} + 梯度累积兼容性测试")
     log("=" * 60)
 
     model_config = get_tiny_config()
 
-    max_tp = world_size // 2  # 预留至少 2 给 DP
+    max_tp = world_size // 2
     tp_size = min(max_tp, 4)
     while tp_size > 1 and model_config.num_key_value_heads % tp_size != 0:
         tp_size -= 1
@@ -507,7 +507,7 @@ def test_zero1_with_grad_accum(world_size, device):
     parallel_ctx = ParallelContext(OrderedDict([("dp", dp_size), ("tp", tp_size)]))
 
     model, mp_manager, grad_sync, strat = create_model_and_optimizer(
-        model_config, parallel_ctx, device, zero_stage=1, seed=42
+        model_config, parallel_ctx, device, zero_stage=zero_stage, seed=42
     )
     model.train()
 
@@ -518,13 +518,16 @@ def test_zero1_with_grad_accum(world_size, device):
     vocab_size = model_config.vocab_size
 
     losses = []
+    
+    torch.manual_seed(5000)
+    data = torch.randint(0, vocab_size, (mbs, seq_len), device=device)
 
     for step in range(num_steps):
         step_loss = 0.0
 
         for micro_step in range(accum_steps):
-            torch.manual_seed(step * accum_steps + micro_step + 5000)
-            data = torch.randint(0, vocab_size, (mbs, seq_len), device=device)
+            # torch.manual_seed(step * accum_steps + micro_step + 5000)
+            # data = torch.randint(0, vocab_size, (mbs, seq_len), device=device)
 
             is_last = (micro_step == accum_steps - 1)
             sync_ctx = nullcontext() if is_last else grad_sync.no_sync()
@@ -568,8 +571,9 @@ def test_zero1_with_grad_accum(world_size, device):
     dist.broadcast(passed_tensor, src=0)
     passed = passed_tensor.item() == 1
 
-    log(f"  {'✓ 测试通过' if passed else '✗ 测试失败'}")
+    log(f"  {'✓ ZeRO-' + str(zero_stage) + ' + grad_accum 通过' if passed else '✗ 测试失败'}")
     return passed
+
 
 def main():
     local_rank = init_distributed()
@@ -578,15 +582,18 @@ def main():
 
     if dist.get_rank() == 0:
         print("=" * 60)
-        print("Femtotron Integration Test: ZeRO-1 正确性")
+        print("Femtotron Integration Test: ZeRO 正确性")
         print(f"World size: {world_size}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print("=" * 60)
 
     passed = True
-    passed &= test_zero1_correctness(world_size, device)
+    passed &= test_zero_correctness(world_size, device)
     dist.barrier()
-    passed &= test_zero1_with_grad_accum(world_size, device)
+
+    for stage in [1, 2, 3]:
+        passed &= test_zero_with_grad_accum(world_size, device, zero_stage=stage)
+        dist.barrier()
 
     dist.destroy_process_group()
     sys.exit(0 if passed else 1)
