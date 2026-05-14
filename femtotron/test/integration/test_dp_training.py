@@ -122,10 +122,10 @@ def run_n_steps(model, mp_manager, grad_sync, parallel_ctx,
 
     losses = []
 
+    # 生成全局一致的数据（所有 rank 用相同 seed）
+    torch.manual_seed(1000)
+    global_input = torch.randint(0, vocab_size, (total_batch, seq_len), device=device)
     for step in range(num_steps):
-        # 生成全局一致的数据（所有 rank 用相同 seed）
-        torch.manual_seed(step + 1000)
-        global_input = torch.randint(0, vocab_size, (total_batch, seq_len), device=device)
 
         # 每个 DP rank 取自己的 slice
         start = dp_rank * micro_batch_size

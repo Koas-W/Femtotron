@@ -104,32 +104,42 @@ endif
 # 集成测试（后续开发时逐步添加）
 # ============================================================
 
-test-integration: test-dp-training test-gradient-accum test-zero1-2 # test-tp-training test-pp-training test-3d-parallel
+test-integration: test-dp-training test-gradient-accum test-zero1-2-3 test-zero-ac # test-tp-training test-pp-training test-3d-parallel
 
 # 1.5 DDP 训练
 # test-dp-training:
 # 	@echo -e "$(YELLOW)>>> [跳过] DDP 训练测试 (待 1.5 实现)$(NC)"
 test-dp-training:
 	@echo -e "$(YELLOW)>>> 测试 DP 训练一致性 (2卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_dp_training.py
+	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_dp_training.py
 ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
 	@echo -e "$(YELLOW)>>> 测试 DP 训练一致性 (4卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_dp_training.py
+	@timeout $(TIMEOUT) $(RUN_4) femtotron/test/integration/test_dp_training.py
 endif
 	@echo -e "$(GREEN)  DP Training ✓$(NC)"
 
 test-gradient-accum:
 	@echo -e "$(YELLOW)>>> 测试梯度累积一致性 (2卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_gradient_accum.py
+	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_gradient_accum.py
 	@echo -e "$(GREEN)  Gradient Accumulation ✓$(NC)"
 	
-test-zero1-2:
+test-zero1-2-3:
 ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
-	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 正确性 (4卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_4) tests/integration/test_zero1_2_3.py
+	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 2 3 正确性 (4卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_4) femtotron/test/integration/test_zero1_2_3.py
 else ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
-	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 正确性 (2卡)$(NC)"
-	@timeout $(TIMEOUT) $(RUN_2) tests/integration/test_zero1_2_3.py
+	@echo -e "$(YELLOW)>>> 测试 ZeRO-1 2 3 正确性 (2卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_zero1_2_3.py
+endif
+	@echo -e "$(GREEN)  ZeRO-1 ✓$(NC)"
+
+test-zero-ac:
+ifeq ($(shell test $(GPUS) -ge 4 && echo yes),yes)
+	@echo -e "$(YELLOW)>>> 测试 ZeRO + Activation Checkpointing 正确性 (4卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_4) femtotron/test/integration/test_zero_ac.py
+else ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
+	@echo -e "$(YELLOW)>>> 测试 ZeRO + Activation Checkpointing 正确性 (2卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_zero_ac.py
 endif
 	@echo -e "$(GREEN)  ZeRO-1 ✓$(NC)"
 

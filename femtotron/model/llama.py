@@ -56,6 +56,9 @@ class LlamaForTraining(nn.Module):
         self.lm_head = nn.Linear(model_config.hidden_size, model_config.vocab_size, bias=False)
         if model_config.tie_word_embeddings:
             self.tie_weights()
+            
+        # 关键:训练时禁用 KV cache,否则和 activation checkpointing 不兼容
+        self.model.config.use_cache = False
 
     def tie_weights(self):
         """Tie lm_head 和 embed_tokens 的权重。to_empty 后需要重新调用。"""

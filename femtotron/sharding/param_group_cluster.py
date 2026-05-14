@@ -235,7 +235,7 @@ class ParamGroupCluster:
         幂等:重复调用直接返回(已 unshard 状态)。
         """
         if self._full_buffer is not None:
-            return
+            return   # 已经是 unsharded 状态,no-op
         
         # 分配 full buffer(padded 大小)
         self._full_buffer = torch.empty(
@@ -263,7 +263,7 @@ class ParamGroupCluster:
         幂等:重复调用直接返回(已 reshard 状态)。
         """
         if self._full_buffer is None:
-            return
+            return   # 已经是 sharded 状态,no-op
         
         for pg in self.param_groups:
             pg.compute.data = torch.empty(

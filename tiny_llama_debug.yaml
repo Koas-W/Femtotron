@@ -11,6 +11,16 @@ tp: 2
 # dp: auto
 pp: 1
 
+# --- ZeRO 配置 ---
+zero_stage: 0                              # 0=baseline / 1 / 2 / 3
+zero_wrap_policy: llama_decoder_layer      # 字符串预设,只 stage 3 用
+
+# --- Activation Checkpointing ---
+ac_enabled: false                          # 总开关
+ac_policy: llama_decoder_layer             # 字符串预设
+ac_use_reentrant: false
+ac_preserve_rng_state: true
+
 # --- 模型 ---
 # model_name 为空时使用随机初始化的 tiny 模型
 model_name: null

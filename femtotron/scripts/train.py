@@ -27,6 +27,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from femtotron.sharding.factory import create_sharding_strategy
+
 # 确保项目根目录在 path 上
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -68,6 +70,18 @@ def parse_args():
     parser.add_argument("--tp", type=int, default=None)
     parser.add_argument("--pp", type=int, default=None)
 
+    # ZeRO 配置
+    parser.add_argument("--zero_stage", type=int, default=None,
+                        help="ZeRO stage: 0=baseline / 1 / 2 / 3")
+    parser.add_argument("--zero_wrap_policy", type=str, default=None,
+                        help="wrap policy preset name (only for stage 3)")
+
+    # AC 配置  
+    parser.add_argument("--ac_enabled", type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=None, help="启用 activation checkpointing")
+    parser.add_argument("--ac_policy", type=str, default=None,
+                    help="AC policy preset name")
+    
     # 模型配置
     parser.add_argument("--model_name", type=str, default=None,
                         help="HuggingFace 模型名或路径")
@@ -223,8 +237,33 @@ def build_all(config: dict):
     weight_decay = config.get("weight_decay", 0.01)
     compute_param_groups = get_param_groups(model, weight_decay=weight_decay)
 
+    # ─── 新增:ZeRO strategy ───
+    from femtotron.sharding.factory import create_sharding_strategy
+    from femtotron.parallel.data_parallel.gradient_synchronizer import create_grad_synchronizer
+    from femtotron.sharding.zero_config import ZeROConfig
+    from femtotron.scripts.presets import get_wrap_policy, get_ac_policy
+    
+    zero_stage = config.get("zero_stage", 0)
+    if zero_stage == 3:
+        wrap_policy_name = config.get("zero_wrap_policy")
+        if not wrap_policy_name:
+            raise ValueError("zero_stage=3 但没指定 zero_wrap_policy")
+        wrap_policy = get_wrap_policy(wrap_policy_name)
+    else:
+        wrap_policy = None
+    
+    zero_config = ZeROConfig(
+        stage=zero_stage,
+        wrap_policy=wrap_policy,
+    )
+    strategy = create_sharding_strategy(parallel_ctx, zero_config)
+    
+    log(f"ZeRO 配置: stage={zero_stage}, strategy={type(strategy).__name__}")
+    
+    # ─── MixedPrecisionManager 构造 ───
     mp_manager = MixedPrecisionManager(
         model=model,
+        sharding_strategy=strategy,
         parallel_ctx=parallel_ctx,
         parallel_plan=plan,
         config=train_config,
@@ -236,6 +275,27 @@ def build_all(config: dict):
         },
         compute_param_groups=compute_param_groups,
     )
+    
+    # ─── 应用 Activation Checkpointing ───
+    if config.get("ac_enabled", False):
+        from femtotron.training.activation_ckpt import (
+            apply_activation_checkpointing
+        )
+        ac_policy_name = config.get("ac_policy")
+        if not ac_policy_name:
+            raise ValueError("ac_enabled=True 但没指定 ac_policy")
+        
+        ac_policy = get_ac_policy(ac_policy_name)   # 此处类型确定是 Callable
+        n_wrapped = apply_activation_checkpointing(
+            model,
+            ac_policy,
+            use_reentrant=config.get("ac_use_reentrant", False),
+            preserve_rng_state=config.get("ac_preserve_rng_state", False),
+        )
+        log(f"  Activation checkpointing: wrapped {n_wrapped} modules")
+    else:
+        log(f"  Activation checkpointing: disabled")
+    
 
     log(f"训练配置:")
     log(f"  LR: {lr}, Weight Decay: {weight_decay}")
@@ -299,8 +359,11 @@ def build_all(config: dict):
     tokens_per_step = micro_batch_size * seq_len * dp_size
     log(f"  Tokens/step (全局): {tokens_per_step:,}")
 
-    # ─── DDP 梯度同步 ───
-    grad_sync = DataParallelGradSync(param_groups=mp_manager.groups, parallel_ctx=parallel_ctx)
+    # ─── DDP 梯度同步 用 factory 构造 grad_sync ───
+    grad_sync = create_grad_synchronizer(
+        mp_manager.groups, parallel_ctx, strategy
+    )
+    log(f"  Grad sync: {type(grad_sync).__name__}")
 
     # ─── Trainer ───
     trainer = Trainer(

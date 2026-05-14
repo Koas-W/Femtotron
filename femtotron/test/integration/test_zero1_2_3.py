@@ -511,6 +511,10 @@ def test_zero_with_grad_accum(world_size, device, zero_stage):
     )
     model.train()
 
+    # 显式触发 hook 注册(ZeRO-2 必需,其他 stage 是 no-op)
+    if hasattr(strat, 'prepare_for_backward'):
+        strat.prepare_for_backward(mp_manager.groups)
+    
     num_steps = 5
     accum_steps = 2
     mbs = 4
@@ -559,9 +563,13 @@ def test_zero_with_grad_accum(world_size, device, zero_stage):
     passed &= init_ok
 
     # Weight 一致性
-    weights_ok, weight_diff = verify_weights_consistent_across_dp(model, parallel_ctx)
-    log(f"  {'✓' if weights_ok else '✗'} DP rank 间 weight 一致 (diff={weight_diff:.8f})")
-    passed &= weights_ok
+    if zero_stage <= 2:
+        # ZeRO-1/2: 每个 rank 持有完整参数，应该一致
+        weights_ok, weight_diff = verify_weights_consistent_across_dp(model, parallel_ctx)
+        log(f"  {'✓' if weights_ok else '✗'} DP rank 间 weight 一致 (diff={weight_diff:.8f})")
+        passed &= weights_ok
+    else:
+        log(f"  ○ 跳过 weight 一致性检查（ZeRO-3 下参数是分片的）")
 
     del model, mp_manager, grad_sync, strat
     torch.cuda.empty_cache()
