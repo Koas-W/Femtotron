@@ -10,6 +10,8 @@ from transformers import AutoConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama import LlamaModel
 
+from femtotron.model.llama_partial_model import LlamaPartialModel
+from femtotron.model.llama_casual import LlamaForCausalLM
 from femtotron.parallel_context import ParallelContext
 from femtotron.model.parallel_plan import ParallelPlan, ParallelRule, get_llama_parallel_plan
 from femtotron.model.parallelize_model import parallelize_model
@@ -52,7 +54,10 @@ class LlamaForTraining(nn.Module):
         self.parallel_ctx = parallel_ctx
 
         # backbone（不含 lm_head）
-        self.model = LlamaModel(model_config)
+        # self.model = LlamaModel(model_config)
+        # pipeline并行需要的兼容性配置
+        self.model = LlamaPartialModel(model_config, parallel_ctx)
+
         self.lm_head = nn.Linear(model_config.hidden_size, model_config.vocab_size, bias=False)
         if model_config.tie_word_embeddings:
             self.tie_weights()
@@ -81,7 +86,8 @@ class LlamaForTraining(nn.Module):
                - loss = F.cross_entropy(logits_shifted, labels_shifted)
             4. 返回 {"loss": loss, "logits": logits}
         """
-        hidden = self.model(input_ids).last_hidden_state   # [B, S, H]
+        # hidden = self.model(input_ids).last_hidden_state   # [B, S, H]
+        hidden = self.model(input_ids)                     # [B, S, H]
         logits = self.lm_head(hidden)                      # [B, S, V] 或 [B, S, V/tp]，看 gather_output
 
         out: dict = {"logits": logits}
@@ -104,6 +110,18 @@ class LlamaForTraining(nn.Module):
             ignore_index=-100,
         )
 
+    @property
+    def is_first(self) -> bool:
+        return True   # legacy 模型永远是全模型,既是开始也是结束
+
+    @property
+    def is_last(self) -> bool:
+        return True
+
+    @property
+    def hidden_size(self) -> int:
+        return self.config.hidden_size
+    
 # class LlamaBackbone(nn.Module):
 #     def __init__(self, config, parallel_ctx, factory, *, dtype, device):
 #         super().__init__()
@@ -140,21 +158,36 @@ class LlamaForTraining(nn.Module):
 #         hidden_states = self.norm(hidden_states)
 #         return hidden_states
 
-def build_llama_model(model_config: LlamaConfig, parallel_ctx: ParallelContext) -> LlamaForTraining:
+def build_llama_model(
+    model_config: LlamaConfig,
+    parallel_ctx: ParallelContext,
+    *,
+    use_pp_aware: bool = False,
+    layer_range: range | None = None,
+) -> nn.Module:
     """
-    构建训练用模型的完整流程。
+    构建训练用模型。
     
-    1. 从 HuggingFace 加载 config（只是配置，不加载权重）
-    2. 在 meta device 上创建 LlamaForTraining
-       内部创建 HuggingFace 的 LlamaModel，但参数都在 meta device 上
-    3. parallelize_model() 替换线性层为 TP 版本
-       参数仍在 meta device 上，只是类型和 shape 变了
-    4. 返回 model（尚未加载权重）
+    Args:
+        use_pp_aware: 走 PP-aware 路径(LlamaForCausalLM)。默认 False,
+            走旧路径(LlamaForTraining),完全向后兼容。
+            
+            == 何时设 True ==
+            - 真正用 PP 训练时(pp_size > 1)
+            - 想用新 API 但暂时不开 PP(layer_range=None,等价于旧路径,
+              可以用来做 bit-exact 等价性测试)
+        
+        layer_range: PP-aware 模式下本 rank 持有的 decoder layer 范围。
+            None ⇒ 全部(等价于 pp_size=1)。
+            一般由 partition_layers(num_layers, pp_size)[pp_rank] 算出来。
     """
-    # config: LlamaConfig = LlamaConfig.from_pretrained(model_name)
-    
     with torch.device("meta"):
-        model = LlamaForTraining(model_config, parallel_ctx)
+        if use_pp_aware:
+            model = LlamaForCausalLM(
+                model_config, parallel_ctx, layer_range=layer_range,
+            )
+        else:
+            model = LlamaForTraining(model_config, parallel_ctx)
     
     parallel_plan = get_llama_parallel_plan()
     parallelize_model(model, parallel_plan, parallel_ctx)

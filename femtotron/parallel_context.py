@@ -42,9 +42,12 @@ class ParallelContext:
         # 示例：shape = [pp_size, dp_size, tp_size]，右侧为内侧（物理相邻）维度
         self.rank_grid = torch.arange(self.world_size).reshape(self.dim_sizes)
         # 计算本rank的位置
-        self.local_coord = cast(list[int], torch.unravel_index(torch.tensor(self.world_rank), self.dim_sizes))
+        # self.local_coord = cast(list[int], torch.unravel_index(torch.tensor(self.world_rank), self.dim_sizes))
         # self.local_coord = cast(tuple[int, ...], self.local_coord)
         # print(self.local_coord)
+        self.local_coord = [
+            int(c) for c in torch.unravel_index(torch.tensor(self.world_rank), self.dim_sizes)
+        ]
 
         # 为每个维度创建 process group
         self.groups = {}      # dim_name -> ProcessGroup

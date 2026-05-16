@@ -4,3 +4,4 @@ femtotron/**/__pycache__
 femtotron/**/**/__pycache__
 femtotron/checkpoints
 *.pt
+*.pickle
