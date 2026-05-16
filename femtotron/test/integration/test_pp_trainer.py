@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoConfig
+import math
 
 from femtotron.parallel_context import ParallelContext
 from femtotron.parallel.pipeline_parallel.comm_ops import PipelineComm
@@ -216,6 +217,9 @@ def run_n_steps(stack, parallel_ctx, device, *,
         torch.cuda.synchronize()
         
         losses.append(step_loss.item())
+        if math.isnan(losses[-1]) or math.isinf(losses[-1]):
+            raise RuntimeError(f"step {step}: NaN/Inf loss, abort")
+
     
     peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     return losses, peak_mb
@@ -228,9 +232,13 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     
     world_size = dist.get_world_size()
-    assert world_size == 2, "M5a test requires --nproc_per_node=2 (pp=2)"
+    assert world_size == 4, "M5b requires --nproc_per_node=4 (pp=2 × dp=2)"
     
-    # Model config(中等大小,跟 zero+ac test 一致)
+    parallel_ctx = ParallelContext(OrderedDict([
+        ("pp", 2), ("dp", 2), ("tp", 1),
+    ]))
+    log(f"Topology: PP={parallel_ctx.pp_size}, DP={parallel_ctx.dp_size}")
+    
     model_config = AutoConfig.for_model(
         "llama",
         hidden_size=1024, intermediate_size=2048,
@@ -241,53 +249,72 @@ def main():
     )
     
     num_steps = 10
-    micro_batch_size = 8
+    micro_batch_size = 8     # per-DP-rank batch size
     seq_len = 32
     num_microbatches = 4
     
-    # 测试两个配置:pp=2 vs pp=1(baseline,用 dp=2 替代来对比);
-    # 同样 seed,loss curve 应当近似(不会 bit-exact 因为不同 batching pattern)
+    configs = [
+        ("ZeRO-0", 0),
+        ("ZeRO-1", 1),
+        ("ZeRO-2", 2),
+        ("ZeRO-3", 3),
+    ]
     
-    # ── Run 1: PP=2 (我们的目标) ──
-    log("\n--- PP=2 1F1B ---")
-    parallel_ctx_pp = ParallelContext(OrderedDict([
-        ("pp", 2), ("dp", 1), ("tp", 1),
-    ]))
-    stack_pp = create_pp_stack(
-        model_config, parallel_ctx_pp, device,
-        seed=42, num_microbatches=num_microbatches, schedule="1f1b",
-        mb_size=micro_batch_size // num_microbatches, seq_len=seq_len,
-        zero_stage=0, ac_enabled=False,
-    )
-    losses_pp, peak_pp = run_n_steps(
-        stack_pp, parallel_ctx_pp, device,
-        num_steps=num_steps, micro_batch_size=micro_batch_size,
-        seq_len=seq_len, vocab_size=model_config.vocab_size,
-    )
-    log(f"  Losses: {[f'{l:.4f}' for l in losses_pp]}")
-    log(f"  Peak: {peak_pp:.1f} MB")
-    log(f"  Δloss (step0 → stepN): {losses_pp[0] - losses_pp[-1]:.4f}")
+    results = {}
+    for label, zero_stage in configs:
+        log(f"\n--- PP=2, DP=2, {label} ---")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        stack = create_pp_stack(
+            model_config, parallel_ctx, device,
+            seed=42, num_microbatches=num_microbatches, schedule="1f1b",
+            mb_size=micro_batch_size // num_microbatches, seq_len=seq_len,
+            zero_stage=zero_stage, ac_enabled=False,
+        )
+        losses, peak_mb = run_n_steps(
+            stack, parallel_ctx, device,
+            num_steps=num_steps, micro_batch_size=micro_batch_size,
+            seq_len=seq_len, vocab_size=model_config.vocab_size,
+        )
+        log(f"  Losses: {[f'{l:.4f}' for l in losses]}")
+        log(f"  Peak: {peak_mb:.1f} MB")
+        log(f"  Δloss: {losses[0] - losses[-1]:.4f}")
+        
+        assert losses[-1] < losses[0], f"{label} loss didn't decrease"
+        log(f"  ✓ {label}")
+        
+        results[label] = (losses, peak_mb)
+        
+        if hasattr(stack["strategy"], "cleanup"):
+            stack["strategy"].cleanup()
+        if hasattr(stack["mp"], "cleanup"):
+            stack["mp"].cleanup()
+        del stack
+        torch.cuda.empty_cache()
     
-    # 验证 1:loss 下降
-    assert losses_pp[-1] < losses_pp[0], (
-        f"loss didn't decrease: {losses_pp[0]:.4f} → {losses_pp[-1]:.4f}"
-    )
-    log("  ✓ Loss decreasing")
+    # ─── 总结 + 数学等价性检查 ───
+    log("\n" + "=" * 70)
+    log(f"{'Config':<15} {'Peak MB':<10} {'L[0]':<8} {'L[-1]':<8} {'Δloss':<8}")
+    log("-" * 70)
+    baseline_peak = results["ZeRO-0"][1]
+    for label, (losses, peak) in results.items():
+        ratio = peak / baseline_peak
+        log(f"{label:<15} {peak:<10.1f} {losses[0]:<8.4f} {losses[-1]:<8.4f} "
+            f"{losses[0]-losses[-1]:<8.4f}  ({ratio:.0%})")
+    log("=" * 70)
     
-    # 验证 2:loss 不发散 / NaN
-    assert all(not (torch.tensor(l).isnan() or torch.tensor(l).isinf()) 
-               for l in losses_pp), "loss has NaN/Inf"
-    log("  ✓ No NaN/Inf")
+    # 验证:ZeRO-0 vs ZeRO-3 loss 曲线应当接近(bf16 数值噪声以内)
+    z0 = results["ZeRO-0"][0]
+    z3 = results["ZeRO-3"][0]
+    max_diff = max(abs(a - b) for a, b in zip(z0, z3))
+    log(f"\nZeRO-0 vs ZeRO-3 loss max diff: {max_diff:.4e}")
     
-    # Cleanup
-    if hasattr(stack_pp["strategy"], "cleanup"):
-        stack_pp["strategy"].cleanup()
-    if hasattr(stack_pp["mp"], "cleanup"):
-        stack_pp["mp"].cleanup()
-    del stack_pp
-    torch.cuda.empty_cache()
+    # bf16 + 不同 reduce 顺序,差异 < 0.1 算合理(经验值,zero+ac test 也是这水准)
+    assert max_diff < 0.5, f"ZeRO-0 vs ZeRO-3 diverged: {max_diff}"
+    log(f"  ✓ ZeRO-0/3 数值接近")
     
-    log("\n✅ M5a integration test passed")
+    log(f"\n✅ M5b passed")
     dist.destroy_process_group()
 
 

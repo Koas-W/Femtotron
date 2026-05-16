@@ -70,7 +70,13 @@ class ZeRO2Strategy:
                 shard, flat, op=dist.ReduceOp.AVG, group=self.dp_group
             )
             
-            self._grad_shards[group.name] = shard
+            # self._grad_shards[group.name] = shard
+            # ─── FIX: 累加,不覆盖 ───
+            if group.name in self._grad_shards:
+                self._grad_shards[group.name].add_(shard)
+            else:
+                self._grad_shards[group.name] = shard
+
             param.grad = None    # 释放 compute.grad,这是 ZeRO-2 省显存的关键
         
         handle = group.compute.register_post_accumulate_grad_hook(hook)

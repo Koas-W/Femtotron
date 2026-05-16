@@ -308,12 +308,20 @@ class ParamGroupCluster:
             flat_grad[self.total_numel:].zero_()
         
         # 4. reduce_scatter:本 rank 得到对应 shard 的平均
-        dist.reduce_scatter_tensor(
-            self.flat_grad_shard,
-            flat_grad,
-            op=dist.ReduceOp.AVG,
-            group=self.dp_group,
+        # dist.reduce_scatter_tensor(
+        #     self.flat_grad_shard,
+        #     flat_grad,
+        #     op=dist.ReduceOp.AVG,
+        #     group=self.dp_group,
+        # )
+        # ─── FIX: 先 reduce 到 temp,再累加到 shard ───
+        temp_shard = torch.empty(
+            self.shard_size, dtype=self.compute_dtype, device=self.device,
         )
+        dist.reduce_scatter_tensor(
+            temp_shard, flat_grad, op=dist.ReduceOp.AVG, group=self.dp_group,
+        )
+        self.flat_grad_shard.add_(temp_shard)
         
         # 5. 释放各 compute.grad
         for pg in self.param_groups:
