@@ -74,8 +74,8 @@ class LlamaPartialModel(nn.Module):
         model_config: LlamaConfig,
         parallel_ctx: ParallelContext,
         layer_range: range | None = None,
-        is_first: bool = True,
-        is_last: bool = True,
+        is_first: bool | None = None,
+        is_last: bool | None = None,  # None = 从 layer_range 自动推导
     ):
         """
         Args:
@@ -109,6 +109,11 @@ class LlamaPartialModel(nn.Module):
             raise ValueError(
                 f"layer_range 必须是连续的(step=1),得到 step={layer_range.step}"
             )
+        
+        if is_first is None:
+            is_first = (layer_range.start == 0)
+        if is_last is None:
+            is_last = (layer_range.stop == model_config.num_hidden_layers)
         
         # ★ 手动同步 _attn_implementation,弥补不继承 PreTrainedModel 的 gap
         # PreTrainedModel 会做这件事,我们没继承,需手动补

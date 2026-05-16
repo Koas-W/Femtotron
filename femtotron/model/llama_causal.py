@@ -40,4 +40,9 @@ class LlamaForCausalLM(BaseCausalLMPipeline):
             self.lm_head = nn.Linear(
                 config.hidden_size, config.vocab_size, bias=False,
             )
+            
         # tie_word_embeddings:暂不支持,在 trainer 阶段检测到就报错
+        if config.tie_word_embeddings:
+            raise NotImplementedError(
+                "LlamaForCausalLM 目前不支持 tie_word_embeddings=True"
+            )

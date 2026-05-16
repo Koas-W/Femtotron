@@ -11,7 +11,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama import LlamaModel
 
 from femtotron.model.llama_partial_model import LlamaPartialModel
-from femtotron.model.llama_casual import LlamaForCausalLM
+from femtotron.model.llama_causal import LlamaForCausalLM
 from femtotron.parallel_context import ParallelContext
 from femtotron.model.parallel_plan import ParallelPlan, ParallelRule, get_llama_parallel_plan
 from femtotron.model.parallelize_model import parallelize_model

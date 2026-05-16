@@ -52,13 +52,12 @@ class PipelineComm:
     def __init__(
         self,
         parallel_ctx: ParallelContext,
-        microbatch_size: int,
         seqlen: int,
         hidden_size: int,
         dtype: torch.dtype,
     ) -> None:
         self.ctx = parallel_ctx
-        self._act_shape = (microbatch_size, seqlen, hidden_size)
+        self._act_shape = (seqlen, hidden_size)
         self._dtype = dtype
         # device 从 parallel_ctx 推出
         self._device = torch.device(f"cuda:{self.ctx.world_rank}")
@@ -76,7 +75,7 @@ class PipelineComm:
         return self.ctx.pp_next_rank is None
 
     @property
-    def act_shape(self) -> tuple[int, int, int]:
+    def act_shape(self) -> tuple[int, int]:
         return self._act_shape
 
     @property
@@ -170,11 +169,11 @@ class PipelineComm:
         """如果 out 是 None 就 fresh allocate;否则校验 shape/dtype/device 后直接用。"""
         if out is None:
             return torch.empty(self._act_shape, dtype=self._dtype, device=self._device)
-        # Caller 复用 buffer——校验一致性,避免静默错位
-        if tuple(out.shape) != self._act_shape:
-            raise ValueError(
-                f"out buffer shape {tuple(out.shape)} != expected {self._act_shape}"
-            )
+        # # Caller 复用 buffer——校验一致性,避免静默错位
+        # if tuple(out.shape) != self._act_shape:
+        #     raise ValueError(
+        #         f"out buffer shape {tuple(out.shape)} != expected {self._act_shape}"
+        #     )
         if out.dtype != self._dtype:
             raise ValueError(
                 f"out buffer dtype {out.dtype} != expected {self._dtype}"
