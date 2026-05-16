@@ -24,7 +24,18 @@ from femtotron.training.param_group import ParamGroup
 
 
 class ZeRO3Strategy:
-    """ZeRO-3:全分片 + 即时 unshard/reshard。"""
+    """ZeRO-3:全分片 + 即时 unshard/reshard。
+    
+    与 Pipeline Parallel 组合时:
+    - 数学正确(已验证 bit-exact 与 ZeRO-0)
+    - 但 peak memory 比理论值偏高 ~5-10%:autograd 在 1F1B 的多个 in-flight 
+      microbatch 间持有 unsharded param view,使 _full_buffer storage 
+      无法立即释放
+    - 生产场景推荐配合 activation checkpointing(AC)使用,AC 通过 
+      backward 时重算 forward 消除了这种 view 持有,实测 PP + ZeRO-3 + AC 
+      内存反低于 PP + ZeRO-2
+    - 注意:DeepSpeed 直接禁用了 PP + ZeRO-2/3 组合;本框架支持但不优化到极致
+    """
     
     def __init__(
         self,

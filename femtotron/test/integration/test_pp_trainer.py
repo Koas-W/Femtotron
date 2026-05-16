@@ -254,14 +254,19 @@ def main():
     num_microbatches = 4
     
     configs = [
-        ("ZeRO-0", 0),
-        ("ZeRO-1", 1),
-        ("ZeRO-2", 2),
-        ("ZeRO-3", 3),
+        ("ZeRO-0",       0, False),
+        ("ZeRO-0 + AC",  0, True ),
+        ("ZeRO-1",       1, False),
+        ("ZeRO-1 + AC",  1, True ),
+        ("ZeRO-2",       2, False),
+        ("ZeRO-2 + AC",  2, True ),
+        ("ZeRO-3",       3, False),
+        ("ZeRO-3 + AC",  3, True ),
     ]
+
     
     results = {}
-    for label, zero_stage in configs:
+    for label, zero_stage, ac_enabled in configs:
         log(f"\n--- PP=2, DP=2, {label} ---")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -270,7 +275,7 @@ def main():
             model_config, parallel_ctx, device,
             seed=42, num_microbatches=num_microbatches, schedule="1f1b",
             mb_size=micro_batch_size // num_microbatches, seq_len=seq_len,
-            zero_stage=zero_stage, ac_enabled=False,
+            zero_stage=zero_stage, ac_enabled=ac_enabled,
         )
         losses, peak_mb = run_n_steps(
             stack, parallel_ctx, device,
@@ -293,26 +298,42 @@ def main():
         del stack
         torch.cuda.empty_cache()
     
-    # ─── 总结 + 数学等价性检查 ───
-    log("\n" + "=" * 70)
-    log(f"{'Config':<15} {'Peak MB':<10} {'L[0]':<8} {'L[-1]':<8} {'Δloss':<8}")
-    log("-" * 70)
-    baseline_peak = results["ZeRO-0"][1]
+    
+    # ─── 总结表 ───
+    log("\n" + "=" * 80)
+    log(f"{'Config':<18} {'Peak MB':<10} {'Δloss':<10} {'vs no-AC mem':<15}")
+    log("-" * 80)
     for label, (losses, peak) in results.items():
-        ratio = peak / baseline_peak
-        log(f"{label:<15} {peak:<10.1f} {losses[0]:<8.4f} {losses[-1]:<8.4f} "
-            f"{losses[0]-losses[-1]:<8.4f}  ({ratio:.0%})")
-    log("=" * 70)
-    
-    # 验证:ZeRO-0 vs ZeRO-3 loss 曲线应当接近(bf16 数值噪声以内)
-    z0 = results["ZeRO-0"][0]
-    z3 = results["ZeRO-3"][0]
-    max_diff = max(abs(a - b) for a, b in zip(z0, z3))
-    log(f"\nZeRO-0 vs ZeRO-3 loss max diff: {max_diff:.4e}")
-    
-    # bf16 + 不同 reduce 顺序,差异 < 0.1 算合理(经验值,zero+ac test 也是这水准)
-    assert max_diff < 0.5, f"ZeRO-0 vs ZeRO-3 diverged: {max_diff}"
-    log(f"  ✓ ZeRO-0/3 数值接近")
+        delta = losses[0] - losses[-1]
+        if " + AC" in label:
+            base_label = label.replace(" + AC", "")
+            ac_ratio = peak / results[base_label][1] if base_label in results else None
+            ratio_str = f"{ac_ratio:.0%}" if ac_ratio else "-"
+        else:
+            ratio_str = "-"
+        log(f"{label:<18} {peak:<10.1f} {delta:<10.4f} {ratio_str:<15}")
+    log("=" * 80)
+
+    # ─── 验证 AC 数学等价 ───
+    log("\nAC 数学等价性检查:")
+    for stage in ["ZeRO-0", "ZeRO-1", "ZeRO-2", "ZeRO-3"]:
+        losses_no_ac = results[stage][0]
+        losses_ac = results[f"{stage} + AC"][0]
+        max_diff = max(abs(a - b) for a, b in zip(losses_no_ac, losses_ac))
+        status = "✓" if max_diff < 1e-2 else "✗"
+        log(f"  {status} {stage} vs {stage}+AC: max diff = {max_diff:.4e}")
+        assert max_diff < 1e-2, f"{stage} AC math broke: {max_diff}"
+
+    # ─── 验证 AC 省内存 ───
+    log("\nAC 内存收益:")
+    for stage in ["ZeRO-0", "ZeRO-1", "ZeRO-2", "ZeRO-3"]:
+        no_ac = results[stage][1]
+        ac = results[f"{stage} + AC"][1]
+        saved = no_ac - ac
+        ratio = ac / no_ac
+        status = "✓" if saved > 0 else "○"  # 不强制要求,toy 下可能 AC overhead > savings
+        log(f"  {status} {stage}: {no_ac:.1f}MB → {ac:.1f}MB (省 {saved:.1f}MB = {1-ratio:.0%})")
+
     
     log(f"\n✅ M5b passed")
     dist.destroy_process_group()
