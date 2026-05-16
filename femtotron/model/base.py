@@ -12,14 +12,14 @@ class BaseCausalLMPipeline(nn.Module):
     is_last: bool
     hidden_size: int
     
-    def forward(self, x, labels=None):
-        hidden_states = self.model(x) # type: ignore
+    def forward(self, x, labels=None, materialize_logits: bool = True) -> dict:
+        hidden = self.model(x)
         if not self.is_last:
-            return hidden_states
-        logits = self.lm_head(hidden_states) # type: ignore
-        if labels is None:
-            return logits
-        return self._compute_loss(logits, labels)
+            return {"loss": None, "logits": None, "hidden_states": hidden}
+        
+        logits = self.lm_head(hidden)
+        loss = self._compute_loss(logits, labels) if labels is not None else None
+        return {"loss": loss, "logits": logits, "hidden_states": None}
     
     def _compute_loss(self, logits, labels):
         shift_logits = logits[..., :-1, :].contiguous()

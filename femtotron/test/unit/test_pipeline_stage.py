@@ -341,8 +341,8 @@ def test_mid_stage_grad_flow():
 
     # Path A: direct
     h = hidden_in.clone().detach().requires_grad_(True)
-    out = model_direct(h)
-    out.backward(grad_out)
+    out = model_direct(h, labels=None)  # mid stage 没有 labels,直接输出 hidden
+    out["hidden_states"].backward(grad_out)
     input_grad_direct = h.grad.clone()
     param_grads_direct = clone_grads(model_direct)
 

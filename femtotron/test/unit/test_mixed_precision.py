@@ -32,7 +32,6 @@ from femtotron.parallel.tensor_parallel.embedding import VocabParallelEmbedding
 from femtotron.model.parallel_plan import get_llama_parallel_plan
 from femtotron.model.model_loader import ModelLoader
 from femtotron.model.llama import build_llama_model
-# === 根据你的实际路径调整 ===
 from femtotron.training.mixed_precision_manager import MixedPrecisionManager
 from femtotron.training.optimizer import get_param_groups  # 或者你放在哪里
 from femtotron.training.train_config import TrainConfig          # 你的训练配置类

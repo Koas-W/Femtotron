@@ -33,6 +33,8 @@ from femtotron.parallel.pipeline_parallel.runner import PipelineRunner
 from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule
 from femtotron.parallel.pipeline_parallel.stage import PipelineStage
 from femtotron.model.llama_causal import LlamaForCausalLM
+from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule, one_f_one_b_schedule
+from femtotron.parallel.pipeline_parallel.partition import partition_layers
 
 
 # ────────────────────── helpers ──────────────────────
@@ -49,14 +51,15 @@ def init_distributed():
 def log(msg: str) -> None:
     """Print prefixed by rank to keep multi-rank logs readable."""
     rank = dist.get_rank() if dist.is_initialized() else 0
-    print(f"[rank {rank}] {msg}", flush=True)
+    if rank == 0:
+        print(f"[rank {rank}] {msg}", flush=True)
 
 
 def make_config() -> LlamaConfig:
     return LlamaConfig(
         vocab_size=1024,
-        hidden_size=256,
-        intermediate_size=512,
+        hidden_size=1024,
+        intermediate_size=2048,
         num_hidden_layers=4,
         num_attention_heads=8,
         num_key_value_heads=4,
@@ -158,29 +161,38 @@ def clone_grads(model) -> dict[str, torch.Tensor]:
 
 # ────────────────────── tests ──────────────────────
 
-def test_pp2_gpipe_equivalence(num_microbatches: int):
-    """Compare PP path (Runner + GPipe + Stage + Comm) vs single-rank baseline.
+def test_pp_schedule_equivalence(
+    pp_size: int,
+    num_microbatches: int,
+    schedule_name: str,  # "gpipe" or "1f1b"
+):
+    """Compare PP via Runner vs single-rank baseline.
 
-    Args:
-        num_microbatches: N. Global batch is split into N micro-batches.
+    Same framework as M3c, but parameterized:
+        - pp_size: 2, 3, ... (must match torchrun world_size)
+        - num_microbatches: any N >= 1
+        - schedule_name: "gpipe" or "1f1b"
     """
-    log(f"Test: PP2 GPipe equivalence, N={num_microbatches}")
-
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    assert world_size == 2, f"requires --nproc_per_node=2, got {world_size}"
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
+    # Skip if world_size doesn't match (so one file handles --nproc=2 and =3)
+    if world_size != pp_size:
+        if rank == 0:
+            log(f"  [SKIP] requires world_size={pp_size}, got {world_size}")
+        dist.barrier()
+        return
+
+    log(f"Test: pp_size={pp_size}, N={num_microbatches}, schedule={schedule_name}")
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     config = make_config()
     num_layers = config.num_hidden_layers
-    assert num_layers % 2 == 0
-    half = num_layers // 2
 
-    ctx = ParallelContext(OrderedDict([("pp", 2), ("dp", 1), ("tp", 1)]))
+    ctx = ParallelContext(
+        OrderedDict([("pp", pp_size), ("dp", 1), ("tp", 1)])
+    )
 
-    # ── 1) Build full baseline (identical on both ranks via shared seed) ──
-    # layer_range=range(0, num_layers) → is_first=True AND is_last=True
-    # (full standalone model; runs locally without inter-rank comm)
+    # ── 1) Build full baseline (identical on all ranks via seed=42) ──
     baseline = make_model(
         config, ctx, device,
         layer_range=range(0, num_layers), seed=42,
@@ -188,22 +200,23 @@ def test_pp2_gpipe_equivalence(num_microbatches: int):
     assert baseline.is_first and baseline.is_last
 
     # ── 2) Build PP partial for this rank ──
-    if rank == 0:
-        layer_range = range(0, half)         # is_first=True, is_last=False
-    else:
-        layer_range = range(half, num_layers)  # is_first=False, is_last=True
+    # partition_layers returns layer index lists per rank
+    partitions = partition_layers(num_layers, pp_size, strategy="uniform")
+    my_layers = partitions[rank]
+    layer_range = range(my_layers[0], my_layers[-1] + 1)
+    log(f"  rank {rank}: layers {list(layer_range)}")
+
     partial = make_model(
         config, ctx, device,
-        layer_range=layer_range, seed=999,  # seed doesn't matter, gets overwritten
+        layer_range=layer_range, seed=999,  # gets overwritten by sync
     )
-
-    # ── 3) Sync partial's weights from baseline ──
     sync_partial_from_full(partial, baseline)
 
-    # ── 4) Generate same data on both ranks ──
-    torch.manual_seed(123)  # same seed across ranks → same data
-    global_batch_size = num_microbatches  # 1 sample per microbatch for clarity
-    seqlen = 32
+    # ── 3) Generate same data on all ranks ──
+    torch.manual_seed(123)
+    mb_size = 2  # >1 to keep activations substantive
+    global_batch_size = num_microbatches * mb_size
+    seqlen = 1024
     input_ids = torch.randint(
         0, config.vocab_size, (global_batch_size, seqlen),
         dtype=torch.long, device=device,
@@ -213,72 +226,60 @@ def test_pp2_gpipe_equivalence(num_microbatches: int):
         dtype=torch.long, device=device,
     )
 
-    # ── 5) Run PP path ──
-    loss_scale = 1.0 / num_microbatches  # so PP grad ≡ baseline grad
+    # ── 4) Run PP path with selected schedule ──
+    loss_scale = 1.0 / num_microbatches
     stage = PipelineStage(partial, ctx, loss_scale=loss_scale)
     comm = PipelineComm(ctx, seqlen=seqlen, hidden_size=config.hidden_size, dtype=torch.bfloat16)
-    runner = PipelineRunner(stage, comm)
-
-    actions = gpipe_schedule(
-        num_microbatches=num_microbatches,
-        is_first=partial.is_first,
-        is_last=partial.is_last,
-    )
-    log(f"  schedule has {len(actions)} actions")
-
     mb_size = global_batch_size // num_microbatches
     recv_shape = (mb_size, seqlen, config.hidden_size)
-
-    inputs_dict = None
-    labels_dict = None
-    if partial.is_first:
-        input_mbs = split_microbatches(input_ids, num_microbatches)
-        inputs_dict = {i: mb for i, mb in enumerate(input_mbs)}
-    if partial.is_last:
-        label_mbs = split_microbatches(labels, num_microbatches)
-        labels_dict = {i: mb for i, mb in enumerate(label_mbs)}
-
-    pp_losses = runner.run(
-        actions,
+    runner = PipelineRunner(
+        stage, comm,
+        schedule_name=schedule_name,
+        num_microbatches=num_microbatches,
         recv_shape=recv_shape,
         recv_dtype=torch.bfloat16,
-        microbatch_inputs=inputs_dict,
-        microbatch_labels=labels_dict,
     )
-    torch.cuda.synchronize()   # ← 清掉 NCCL stream 的 residual
-    pp_grads = clone_grads(partial)
-    log(f"  PP path done. {len(pp_grads)} params have grads")
+    log(f"  schedule has {len(runner.actions)} actions")
 
-    # ── 6) Run baseline (full model, single forward+backward, local) ──
-    baseline_loss = baseline(input_ids, labels=labels)
+
+    torch.cuda.reset_peak_memory_stats()
+    # run_step 处理 microbatch split,trainer 和 test 共用同一个接口
+    batch = {"input_ids": input_ids, "labels": labels}
+    pp_losses = runner.run_step(batch)
+    torch.cuda.synchronize()  # M3c lesson: flush NCCL stream residual
+    gpipe_peak = torch.cuda.max_memory_allocated() / 1024**2
+    log(f"  Peak memory={gpipe_peak:.1f}MB")
+    pp_grads = clone_grads(partial)
+    log(f"  PP path done ({len(pp_grads)} param grads)")
+
+    # ── 5) Run baseline ──
+    baseline_out = baseline(input_ids, labels=labels)
+    baseline_loss = baseline_out["loss"]          # ← 解 dict
     baseline_loss.backward()
     baseline_grads = clone_grads(baseline)
-    log(f"  baseline loss = {baseline_loss.item():.6f}")
 
-    # ── 7) Compare loss (only last stage owns it) ──
+    # ── 6) Compare loss (last stage owns it) ──
     if partial.is_last:
-        assert len(pp_losses) == num_microbatches
         sorted_losses = [pp_losses[i].detach() for i in range(num_microbatches)]
-        # ↓ pop_all_losses 存的是 scaled loss (= raw × 1/N),所以 sum 才等价于 baseline mean loss
         pp_total_loss = torch.stack(sorted_losses).sum()
-        torch.cuda.synchronize()
         loss_diff = (pp_total_loss - baseline_loss).abs().item()
         log(f"  PP total loss = {pp_total_loss.item():.6f}, "
             f"baseline = {baseline_loss.item():.6f}, diff = {loss_diff:.3e}")
         assert loss_diff < 1e-3, \
-            f"PP total loss {pp_total_loss.item()} != baseline {baseline_loss.item()}"
-        log(f"  ✓ Loss matches within tolerance")
+            f"PP loss {pp_total_loss.item()} != baseline {baseline_loss.item()}"
+        log(f"  ✓ Loss matches")
 
-    # ── 8) Compare grads slice on this rank ──
+    # ── 7) Compare grads (each rank's slice) ──
     baseline_slice = {k: v for k, v in baseline_grads.items() if k in pp_grads}
     assert set(baseline_slice.keys()) == set(pp_grads.keys()), \
-        f"key mismatch: pp has {set(pp_grads) - set(baseline_slice)}, " \
-        f"baseline slice has {set(baseline_slice) - set(pp_grads)}"
-    compare_grads(pp_grads, baseline_slice, tag=f"rank {rank}, N={num_microbatches}")
-    log(f"  ✓ All {len(pp_grads)} param grads match baseline slice")
+        f"key mismatch: extras in pp={set(pp_grads) - set(baseline_slice)}"
+    compare_grads(
+        pp_grads, baseline_slice,
+        tag=f"rank{rank} pp{pp_size} N={num_microbatches} {schedule_name}",
+    )
+    log(f"  ✓ {len(pp_grads)} param grads match baseline slice")
 
-    dist.barrier()  # don't run next test until both ranks done
-
+    dist.barrier()
 
 # ────────────────────── main ──────────────────────
 
@@ -294,10 +295,18 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = False  # be strict about precision
         torch.backends.cudnn.allow_tf32 = False
 
-        tests = [
-            ("N=4 microbatches (typical)", lambda: test_pp2_gpipe_equivalence(4)),
-            ("N=1 microbatch (edge case)", lambda: test_pp2_gpipe_equivalence(1)),
-            ("N=2 microbatches",           lambda: test_pp2_gpipe_equivalence(2)),
+        tests = [            # ── PP=2: existing GPipe (regression) + new 1F1B ──
+            ("PP=2 GPipe N=4", lambda: test_pp_schedule_equivalence(2, 4, "gpipe")),
+            ("PP=2 GPipe N=1", lambda: test_pp_schedule_equivalence(2, 1, "gpipe")),
+            ("PP=2 GPipe N=2", lambda: test_pp_schedule_equivalence(2, 2, "gpipe")),
+            ("PP=2 1F1B  N=4", lambda: test_pp_schedule_equivalence(2, 4, "1f1b")),
+            ("PP=2 1F1B  N=2", lambda: test_pp_schedule_equivalence(2, 2, "1f1b")),
+
+            # ── PP=3: first time exercising mid stage ──
+            ("PP=3 GPipe N=3", lambda: test_pp_schedule_equivalence(3, 3, "gpipe")),
+            ("PP=3 GPipe N=6", lambda: test_pp_schedule_equivalence(3, 6, "gpipe")),
+            ("PP=3 1F1B  N=3", lambda: test_pp_schedule_equivalence(3, 3, "1f1b")),
+            ("PP=3 1F1B  N=6", lambda: test_pp_schedule_equivalence(3, 6, "1f1b")),
         ]
         for desc, fn in tests:
             log(f"\n=== {desc} ===")

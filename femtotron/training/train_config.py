@@ -2,6 +2,7 @@ import torch
 from dataclasses import dataclass, field
 
 from femtotron.sharding.zero_config import ZeROConfig
+from femtotron.parallel.pipeline_parallel.pipeline_config import PipelineConfig
 
 @dataclass
 class TrainConfig:
@@ -32,6 +33,7 @@ class TrainConfig:
     # ZeRO-1 2 3（FSDP）相关
     #####################################################
     ZeRO_config: ZeROConfig = field(default_factory=ZeROConfig)
+    pipeline_config: PipelineConfig = field(default_factory=PipelineConfig)
     # sharding: str = "none"    # 未来: "ddp", "zero1", "zero2", "zero3", "fsdp"
 
     use_loss_scaler: bool = False     # fp16 才开

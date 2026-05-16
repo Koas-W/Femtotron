@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import torch
 
+from femtotron.parallel.pipeline_parallel.microbatch import split_microbatches
+from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule, one_f_one_b_schedule
+
 from .action import (
     PPAction,
     Forward, Backward,
@@ -33,11 +36,39 @@ class PipelineRunner:
         - Loss aggregation across microbatches (caller handles)
     """
 
-    def __init__(self, stage: PipelineStage, comm: PipelineComm):
+    def __init__(self, stage, comm, *,
+                 schedule_name: str = "1f1b",          # "gpipe" or "1f1b"
+                 num_microbatches: int = 1,
+                 recv_shape: tuple[int, ...],
+                 recv_dtype: torch.dtype = torch.bfloat16):
         self.stage = stage
         self.comm = comm
+        self.num_microbatches = num_microbatches
+        self.recv_shape = recv_shape
+        self.recv_dtype = recv_dtype
+        # 构造时一次性算好 action stream(constant across steps)
+        self.actions = self._build_actions(schedule_name)
         self._device = next(stage.model.parameters()).device
 
+    # ── 高层 API:trainer 用这个 ──
+    def run_step(self, batch: dict[str, torch.Tensor]) -> dict[int, torch.Tensor]:
+        """完成一个 batch 的 forward+backward(跨所有 microbatch)。"""
+        inputs_dict = labels_dict = None
+        if self.stage.is_first:
+            input_mbs = split_microbatches(batch["input_ids"], self.num_microbatches)
+            inputs_dict = {i: mb for i, mb in enumerate(input_mbs)}
+        if self.stage.is_last:
+            label_mbs = split_microbatches(batch["labels"], self.num_microbatches)
+            labels_dict = {i: mb for i, mb in enumerate(label_mbs)}
+        return self.run(
+            self.actions,
+            recv_shape=self.recv_shape,
+            recv_dtype=self.recv_dtype,
+            microbatch_inputs=inputs_dict,
+            microbatch_labels=labels_dict,
+        )
+
+    # ── 低层 API:测试 / 高级用法用这个,接口不变 ──
     def run(
         self,
         actions: list[PPAction],
@@ -152,3 +183,18 @@ class PipelineRunner:
         # Forward through model — reads _inputs, writes _outputs (and
         # _loss_values if last stage with labels).
         self.stage.forward(mb_id)
+    
+    @property
+    def is_first_stage(self): return self.stage.is_first
+    @property
+    def is_last_stage(self): return self.stage.is_last
+
+    def _build_actions(self, name: str):
+        ctx = self.stage.parallel_ctx
+        if name == "gpipe":
+            return gpipe_schedule(self.num_microbatches,
+                                  self.stage.is_first, self.stage.is_last)
+        elif name == "1f1b":
+            return one_f_one_b_schedule(self.num_microbatches,
+                                        ctx.pp_size, ctx.pp_rank)
+        raise ValueError(name)

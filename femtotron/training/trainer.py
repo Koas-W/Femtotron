@@ -11,9 +11,10 @@ import torch.nn.functional as F
 from pathlib import Path
 from collections import defaultdict
 from safetensors import safe_open
-from typing import cast
+from typing import cast, Optional
 from torch.optim.lr_scheduler import LRScheduler
 from contextlib import contextmanager, nullcontext
+from collections import OrderedDict
 
 
 from femtotron.parallel_context import ParallelContext
@@ -24,6 +25,7 @@ from femtotron.data.data_loader import DistributedDataLoader
 from femtotron.parallel.data_parallel.gradient_synchronizer import GradientSynchronizer, create_grad_synchronizer
 from femtotron.training.grad_accumulator import GradAccumulator
 from femtotron.training.grad_transform import GradTransform
+from femtotron.parallel.pipeline_parallel.runner import PipelineRunner
 
 class Trainer:
     """
@@ -49,7 +51,8 @@ class Trainer:
                  dataloader: DistributedDataLoader,
                  grad_sync: GradientSynchronizer,
                  parallel_ctx: ParallelContext,
-                 train_config: TrainConfig):
+                 train_config: TrainConfig,
+                 pp_runner: Optional[PipelineRunner] = None):
         """
         config 包含：
         - train_steps: 总训练步数
@@ -67,6 +70,7 @@ class Trainer:
         self.parallel_ctx = parallel_ctx
         self.grad_sync = grad_sync
         self.train_config = train_config
+        self.pp_runner = pp_runner
 
         # 训练状态
         self.global_step = 0
@@ -142,7 +146,15 @@ class Trainer:
             
             self.epoch += 1
     
-    def _train_one_step(self, data_iter) -> dict:
+    # ──────────────────────────────────────────
+    # 训练步骤细节
+    # ──────────────────────────────────────────
+    def _train_one_step(self, data_iter):
+        if self.pp_runner is None:
+            return self._train_one_step_standard(data_iter)
+        return self._train_one_step_pp(data_iter)
+    
+    def _train_one_step_standard(self, data_iter) -> dict:
         """完成一个 optimizer step（含 grad_accum_steps 个 micro batch）。"""
         n = self.train_config.grad_accum_steps
         total_loss = torch.zeros((), device=self.device)
@@ -176,7 +188,37 @@ class Trainer:
             # "successful": step_info.get("successful", True),
             "successful": step_info,
         }
-    
+        
+    def _train_one_step_pp(self, data_iter) -> dict:
+        n = self.train_config.grad_accum_steps
+        ctx = self.parallel_ctx
+        total_loss = torch.zeros((), device=self.device)
+        
+        for grad_step in range(n):
+            batch = next(data_iter)
+            batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+            is_last_accum = grad_step == n - 1
+            sync_ctx = nullcontext() if is_last_accum else self.grad_sync.no_sync()
+            
+            with sync_ctx:
+                pp_losses = self.pp_runner.run_step(batch)   # ← 一行,干净
+                torch.cuda.synchronize()
+                if self.pp_runner.is_last_stage:
+                    # sum(scaled losses) = batch_mean / n;乘 n 还原
+                    total_loss += (sum(pp_losses.values()) * n).detach()
+        
+        if ctx.pp_size > 1:
+            last_pp = ctx.get_ranks_in_group("pp")[-1]
+            dist.broadcast(total_loss, src=last_pp, group=ctx.pp_group)
+        
+        self.grad_sync.sync_gradients()
+        step_info = self.mp_manager.step()
+        self.scheduler.step()
+        return {
+            "loss": (total_loss / n).item(),
+            "lr": self.scheduler.get_last_lr()[0],
+            "successful": step_info,
+        }
     # ──────────────────────────────────────────
     # Logging
     # ──────────────────────────────────────────

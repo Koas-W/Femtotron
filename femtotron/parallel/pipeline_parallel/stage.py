@@ -189,28 +189,28 @@ class PipelineStage:
                     f"call stage_labels({mb_id}) first"
                 )
             # peek,在 model 成功 forward 后才 pop(失败时 labels 不丢)
-            labels = self._labels[mb_id]
+            labels = self._labels.pop(mb_id, None)
         else:
             labels = None
 
         # 跑 model。如果抛异常,下面 commit 不会发生。
-        output = self.model(x, labels=labels)
+        output_dict = self.model(x, labels=labels)
 
-        # Loss scaling 用于 grad accumulation 平衡(在 commit 前做)
-        if self.is_last and labels is not None:
-            if output.ndim != 0:
-                raise RuntimeError(
-                    f"forward({mb_id}): last stage with labels expected scalar loss, "
-                    f"got tensor of shape {tuple(output.shape)}. "
-                    f"Check model._compute_loss returns a scalar tensor."
-                )
-            if self.loss_scale != 1.0:
-                output = output * self.loss_scale
-
-        # Commit:只有 forward 完全成功后才修改 cache
-        self._outputs[mb_id] = output
         if self.is_last:
-            del self._labels[mb_id]
+            if labels is not None:
+                # 训练模式:取 loss,按 loss_scale 缩放(guard 1.0 避免引入 MulBackward)
+                loss = output_dict["loss"]
+                if self.loss_scale != 1.0:
+                    scaled = loss * self.loss_scale
+                else:
+                    scaled = loss
+                self._outputs[mb_id] = scaled
+            else:
+                # 推理模式:存 logits,backward 不会被调用
+                self._outputs[mb_id] = output_dict["logits"]
+        else:
+            # 中间/首段 stage:存 hidden_states,等接收 grad_output
+            self._outputs[mb_id] = output_dict["hidden_states"]
 
     def get_output(self, mb_id: int) -> torch.Tensor:
         """Retrieve output for Runner's SendForward。**不 pop**(backward 时 pop)。"""

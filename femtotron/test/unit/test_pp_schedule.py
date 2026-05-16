@@ -3,9 +3,82 @@
 No GPU, no distributed, no model. Just verifies the schedule structure
 for various (num_microbatches, is_first, is_last) combinations.
 """
-from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule
-from femtotron.parallel.pipeline_parallel.action  import PPAction, Forward, Backward, RecvForward, SendForward, RecvBackward, SendBackward, SendForwardRecvBackward
+from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule, one_f_one_b_schedule
+from collections import defaultdict
+from femtotron.parallel.pipeline_parallel.action import (
+    PPAction,
+    Forward, Backward,
+    RecvForward, SendForward,
+    RecvBackward, SendBackward,
+    SendForwardRecvBackward, SendBackwardRecvForward,
+)
 
+
+# ──────────── helper: per-mb action accounting ────────────
+
+def _per_mb_counts(actions, mb_id):
+    """For mb_id, return (rf, f, sf, rb, b, sb) including combined-op contributions."""
+    rf = f = sf = rb = b = sb = 0
+    for a in actions:
+        if   isinstance(a, Forward)        and a.mb_id == mb_id: f  += 1
+        elif isinstance(a, Backward)       and a.mb_id == mb_id: b  += 1
+        elif isinstance(a, RecvForward)    and a.mb_id == mb_id: rf += 1
+        elif isinstance(a, SendForward)    and a.mb_id == mb_id: sf += 1
+        elif isinstance(a, RecvBackward)   and a.mb_id == mb_id: rb += 1
+        elif isinstance(a, SendBackward)   and a.mb_id == mb_id: sb += 1
+        elif isinstance(a, SendForwardRecvBackward):
+            if a.fwd_mb == mb_id: sf += 1
+            if a.bwd_mb == mb_id: rb += 1
+        elif isinstance(a, SendBackwardRecvForward):
+            if a.bwd_mb == mb_id: sb += 1
+            if a.fwd_mb == mb_id: rf += 1
+    return rf, f, sf, rb, b, sb
+
+
+def _check_per_mb_invariants(actions, num_mb, is_first, is_last, tag):
+    """Each mb must have F=1, B=1, and the right number of each comm op for its role."""
+    expected = {
+        'f': 1, 'b': 1,
+        'rf': 0 if is_first else 1,
+        'sf': 0 if is_last  else 1,
+        'rb': 0 if is_last  else 1,
+        'sb': 0 if is_first else 1,
+    }
+    for mb_id in range(num_mb):
+        rf, f, sf, rb, b, sb = _per_mb_counts(actions, mb_id)
+        got = dict(rf=rf, f=f, sf=sf, rb=rb, b=b, sb=sb)
+        for k, v in expected.items():
+            assert got[k] == v, \
+                f"{tag} mb={mb_id}: {k}={got[k]} (expected {v}); all={got}"
+
+
+def _check_ordering(actions, num_mb, tag):
+    """Per mb: RF < F < SF, RB < B < SB, F < B."""
+    pos = defaultdict(dict)
+    for i, a in enumerate(actions):
+        if   isinstance(a, Forward):      pos['f'][a.mb_id]  = i
+        elif isinstance(a, Backward):     pos['b'][a.mb_id]  = i
+        elif isinstance(a, RecvForward):  pos['rf'][a.mb_id] = i
+        elif isinstance(a, SendForward):  pos['sf'][a.mb_id] = i
+        elif isinstance(a, RecvBackward): pos['rb'][a.mb_id] = i
+        elif isinstance(a, SendBackward): pos['sb'][a.mb_id] = i
+        elif isinstance(a, SendForwardRecvBackward):
+            pos['sf'][a.fwd_mb] = i
+            pos['rb'][a.bwd_mb] = i
+        elif isinstance(a, SendBackwardRecvForward):
+            pos['sb'][a.bwd_mb] = i
+            pos['rf'][a.fwd_mb] = i
+
+    for mb_id in range(num_mb):
+        assert mb_id in pos['f'] and mb_id in pos['b'], \
+            f"{tag} mb={mb_id}: missing F or B"
+        assert pos['f'][mb_id] < pos['b'][mb_id], \
+            f"{tag} mb={mb_id}: F@{pos['f'][mb_id]} >= B@{pos['b'][mb_id]}"
+        for before, after in [('rf','f'), ('f','sf'), ('rb','b'), ('b','sb')]:
+            if mb_id in pos[before] and mb_id in pos[after]:
+                assert pos[before][mb_id] < pos[after][mb_id], \
+                    f"{tag} mb={mb_id}: {before}@{pos[before][mb_id]} " \
+                    f">= {after}@{pos[after][mb_id]}"
 
 def log(msg):
     print(f"  {msg}")
@@ -101,6 +174,111 @@ def test_action_count():
     log("✓ action count matches formula for N ∈ {1,2,4,8}")
 
 
+# ──────────── 1F1B tests ────────────
+
+def test_1f1b_pp1_degenerate():
+    """pp_size=1: F/B interleaved per mb, no comm."""
+    actions = one_f_one_b_schedule(num_microbatches=3, pp_size=1, pp_rank=0)
+    expected = [
+        Forward(mb_id=0), Backward(mb_id=0),
+        Forward(mb_id=1), Backward(mb_id=1),
+        Forward(mb_id=2), Backward(mb_id=2),
+    ]
+    assert actions == expected
+    log("✓ 1F1B pp_size=1: F/B interleaved per mb, no comm")
+
+
+def test_1f1b_pp2_n4_first():
+    """P=2 N=4 stage 0: SFRB in steady, RB in cool-down, no SBRF/RF."""
+    actions = one_f_one_b_schedule(4, 2, 0)
+    _check_per_mb_invariants(actions, 4, is_first=True, is_last=False, tag="P2N4S0")
+    _check_ordering(actions, 4, "P2N4S0")
+    sfrb = sum(1 for a in actions if isinstance(a, SendForwardRecvBackward))
+    sbrf = sum(1 for a in actions if isinstance(a, SendBackwardRecvForward))
+    assert sfrb == 3 and sbrf == 0
+    assert len(actions) == 13
+    log(f"✓ 1F1B P=2 N=4 stage 0: 13 actions ({sfrb} SFRB, {sbrf} SBRF)")
+
+
+def test_1f1b_pp2_n4_last():
+    """P=2 N=4 stage 1: SBRF in steady, RF first, plain SB on last steady."""
+    actions = one_f_one_b_schedule(4, 2, 1)
+    _check_per_mb_invariants(actions, 4, is_first=False, is_last=True, tag="P2N4S1")
+    _check_ordering(actions, 4, "P2N4S1")
+    sfrb = sum(1 for a in actions if isinstance(a, SendForwardRecvBackward))
+    sbrf = sum(1 for a in actions if isinstance(a, SendBackwardRecvForward))
+    assert sfrb == 0 and sbrf == 3
+    assert len(actions) == 13
+    log(f"✓ 1F1B P=2 N=4 stage 1: 13 actions ({sfrb} SFRB, {sbrf} SBRF)")
+
+
+def test_1f1b_pp3_n4_mid():
+    """P=3 N=4 stage 1 (mid): BOTH SFRB and SBRF should appear."""
+    actions = one_f_one_b_schedule(4, 3, 1)
+    _check_per_mb_invariants(actions, 4, is_first=False, is_last=False, tag="P3N4S1")
+    _check_ordering(actions, 4, "P3N4S1")
+    sfrb = sum(1 for a in actions if isinstance(a, SendForwardRecvBackward))
+    sbrf = sum(1 for a in actions if isinstance(a, SendBackwardRecvForward))
+    assert sfrb > 0 and sbrf > 0, f"mid stage should use both combined ops"
+    log(f"✓ 1F1B P=3 N=4 stage 1 (mid): {len(actions)} actions, "
+        f"{sfrb} SFRB, {sbrf} SBRF (both > 0 ✓)")
+
+
+def test_1f1b_n_equals_p():
+    """N == P: stage 0 has all-warmup, no steady. Should still be valid."""
+    for pp_size in [2, 3, 4]:
+        for pp_rank in range(pp_size):
+            actions = one_f_one_b_schedule(pp_size, pp_size, pp_rank)
+            tag = f"NeqP P{pp_size}R{pp_rank}"
+            _check_per_mb_invariants(actions, pp_size,
+                                     is_first=(pp_rank == 0),
+                                     is_last=(pp_rank == pp_size - 1),
+                                     tag=tag)
+            _check_ordering(actions, pp_size, tag)
+    log("✓ 1F1B N=P edge: invariants hold P ∈ {2,3,4}")
+
+
+def test_1f1b_n_less_than_p():
+    """N < P: warmup capped at N, num_steady=0 for some stages."""
+    pp_size, num_mb = 4, 2
+    for pp_rank in range(pp_size):
+        actions = one_f_one_b_schedule(num_mb, pp_size, pp_rank)
+        tag = f"NltP P{pp_size}R{pp_rank}"
+        _check_per_mb_invariants(actions, num_mb,
+                                 is_first=(pp_rank == 0),
+                                 is_last=(pp_rank == pp_size - 1),
+                                 tag=tag)
+        _check_ordering(actions, num_mb, tag)
+    log("✓ 1F1B N<P edge (P=4, N=2): invariants hold")
+
+
+def test_1f1b_invalid_args():
+    for kwargs in [
+        dict(num_microbatches=0, pp_size=2, pp_rank=0),
+        dict(num_microbatches=4, pp_size=0, pp_rank=0),
+        dict(num_microbatches=4, pp_size=2, pp_rank=-1),
+        dict(num_microbatches=4, pp_size=2, pp_rank=2),  # rank >= size
+    ]:
+        try:
+            one_f_one_b_schedule(**kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"Expected ValueError for {kwargs}")
+    log("✓ 1F1B invalid args rejected")
+
+
+def test_1f1b_compute_count_invariant():
+    """Cross-product sanity: every stage always does exactly N forwards and N backwards."""
+    for num_mb in [1, 2, 4, 8]:
+        for pp_size in [1, 2, 3, 4]:
+            for pp_rank in range(pp_size):
+                actions = one_f_one_b_schedule(num_mb, pp_size, pp_rank)
+                f = sum(1 for a in actions if isinstance(a, Forward))
+                b = sum(1 for a in actions if isinstance(a, Backward))
+                assert f == num_mb, f"N={num_mb} P={pp_size} R={pp_rank}: F={f}"
+                assert b == num_mb, f"N={num_mb} P={pp_size} R={pp_rank}: B={b}"
+    log("✓ 1F1B compute count invariant: every stage has N F's and N B's")
+    
 def main():
     tests = [
         test_pp1_degenerate,
@@ -110,6 +288,15 @@ def main():
         test_single_microbatch,
         test_invalid_num_mb,
         test_action_count,
+        # 1F1B tests (M4)
+        test_1f1b_pp1_degenerate,
+        test_1f1b_pp2_n4_first,
+        test_1f1b_pp2_n4_last,
+        test_1f1b_pp3_n4_mid,
+        test_1f1b_n_equals_p,
+        test_1f1b_n_less_than_p,
+        test_1f1b_invalid_args,
+        test_1f1b_compute_count_invariant,
     ]
     print(f"\nRunning {len(tests)} unit tests for gpipe_schedule\n")
     for t in tests:
